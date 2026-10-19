@@ -1,0 +1,169 @@
+name: Fork External Live Tests (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Fork PR number to validate with external live tests"
+        required: true
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+  id-token: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  external-live:
+    name: Run Fork External Live Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: external-live-tests
+    steps:
+      - name: Resolve PR context
+        id: pr
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const prNumber = Number("${{ inputs.pr_number }}");
+            if (!Number.isInteger(prNumber) || prNumber <= 0) {
+              core.setFailed("pr_number must be a positive integer.");
+              return;
+            }
+
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            if (!pr.head.repo) {
+              core.setFailed(`PR #${prNumber} fork repository no longer exists.`);
+              return;
+            }
+
+            core.setOutput("pr_number", String(pr.number));
+            core.setOutput("head_sha", pr.head.sha);
+            core.setOutput("is_fork", String(pr.head.repo.fork));
+            core.setOutput("merge_ref", `refs/pull/${pr.number}/merge`);
+
+      - name: Ensure PR is from fork
+        if: steps.pr.outputs.is_fork != 'true'
+        run: |
+          echo "PR #${{ steps.pr.outputs.pr_number }} is not a fork PR."
+          echo "Use the normal CI workflows for internal branches."
+          exit 1
+
+      - name: Checkout PR merge ref
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ steps.pr.outputs.merge_ref }}
+
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-07-13
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: "rust-dev"
+          save-if: false
+
+      - name: Install just
+        uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4.0.0
+        with:
+          just-version: "1.50.0"
+
+      - name: Build workspace
+        run: just build
+
+      - uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534 # v2.0.0
+        with:
+          auth-method: oidc
+          doppler-identity-id: ${{ vars.DOPPLER_SERVICE_IDENTITY_ID }}
+          doppler-project: ${{ vars.DOPPLER_PROJECT || 'kora' }}
+          doppler-config: ${{ vars.DOPPLER_CONFIG_EXTERNAL_LIVE || vars.DOPPLER_CONFIG_CI || 'stg_github' }}
+          inject-env-vars: true
+
+      - name: Ensure Jupiter API key is configured
+        run: |
+          if [ -z "${JUPITER_API_KEY}" ]; then
+            echo "JUPITER_API_KEY is required for fork external live tests." >&2
+            exit 1
+          fi
+
+      - name: Run external live tests
+        run: cargo test -p tests --test external
+
+      - name: Cleanup test environment
+        if: always()
+        uses: ./.github/actions/cleanup-test-env
+
+
+      - name: Verify PR head is unchanged
+        if: success()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const prNumber = Number("${{ steps.pr.outputs.pr_number }}");
+            const testedSha = "${{ steps.pr.outputs.head_sha }}";
+            const { data: pr } = await github.rest.pulls.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+
+            if (pr.head.sha !== testedSha) {
+              core.setFailed(
+                `PR head changed during manual validation. tested=${testedSha}, current=${pr.head.sha}.`
+              );
+              return;
+            }
+
+      - name: Record fork live approval marker
+        if: success()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const prNumber = Number("${{ steps.pr.outputs.pr_number }}");
+            const headSha = "${{ steps.pr.outputs.head_sha }}";
+            const marker = `fork-external-live-pass:${headSha}`;
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              body: `✅ Fork external live tests passed.\n\n${marker}\nrun: ${runUrl}`,
+            });
+
+      - name: Rerun fork live gate
+        if: success()
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const headSha = "${{ steps.pr.outputs.head_sha }}";
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: "fork-live-gate.yml",
+              event: "pull_request",
+              head_sha: headSha,
+              per_page: 20,
+            });
+
+            const gateRun = runs.data.workflow_runs.find((run) => run.status === "completed");
+            if (!gateRun) {
+              core.warning(
+                `No completed fork-live-gate workflow run found for ${headSha}. ` +
+                  "Re-run the gate workflow manually if required."
+              );
+              return;
+            }
+
+            await github.rest.actions.reRunWorkflow({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: gateRun.id,
+            });

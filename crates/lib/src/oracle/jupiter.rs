@@ -1,30 +1,72 @@
 use super::{PriceOracle, PriceSource, TokenPrice};
-use crate::error::KoraError;
-use reqwest::Client;
+use crate::{
+    constant::{JUPITER_API_URL, SOL_MINT},
+    error::KoraError,
+    sanitize_error,
+    validator::math_validator,
+};
+use once_cell::sync::Lazy;
+use parking_lot::RwLock;
+use reqwest::{Client, StatusCode};
+use rust_decimal::Decimal;
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
-const JUPITER_API_URL: &str = "https://api.jup.ag/price/v2";
+const JUPITER_AUTH_HEADER: &str = "x-api-key";
 
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct JupiterResponse {
-    data: HashMap<String, JupiterPriceData>,
-    #[serde(rename = "timeTaken")]
-    #[allow(dead_code)]
-    time_taken: f64,
+const JUPITER_DEFAULT_CONFIDENCE: f64 = 0.95;
+
+const MAX_REASONABLE_PRICE: f64 = 1_000_000.0;
+const MIN_REASONABLE_PRICE: f64 = 0.000_000_001;
+
+static GLOBAL_JUPITER_API_KEY: Lazy<Arc<RwLock<Option<String>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(None)));
+
+/// Get the global Jupiter API key, falling back to environment variable
+fn get_jupiter_api_key() -> Option<String> {
+    let api_key_guard = GLOBAL_JUPITER_API_KEY.read();
+    api_key_guard.clone().or_else(|| std::env::var("JUPITER_API_KEY").ok())
 }
 
+type JupiterResponse = HashMap<String, JupiterPriceData>;
+
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct JupiterPriceData {
-    id: String,
-    #[serde(rename = "type")]
-    price_type: String,
-    price: String,
+    #[serde(rename = "usdPrice")]
+    usd_price: f64,
+    #[serde(rename = "blockId")]
+    block_id: u64,
+    #[allow(dead_code)]
+    decimals: u8,
+    #[serde(rename = "priceChange24h")]
+    #[allow(dead_code)]
+    price_change_24h: Option<f64>,
 }
 
-pub struct JupiterPriceOracle;
+pub struct JupiterPriceOracle {
+    api_url: String,
+    api_key: String,
+}
+
+impl JupiterPriceOracle {
+    pub fn new() -> Result<Self, KoraError> {
+        let api_key = get_jupiter_api_key().ok_or_else(|| {
+            log::error!("Jupiter API key not found. Set JUPITER_API_KEY environment variable.");
+            KoraError::ConfigError(
+                "Jupiter API key not found. Set JUPITER_API_KEY environment variable".to_string(),
+            )
+        })?;
+
+        let api_url = Self::build_price_api_url(JUPITER_API_URL);
+
+        Ok(Self { api_url, api_key })
+    }
+
+    fn build_price_api_url(base_url: &str) -> String {
+        let trimmed = base_url.trim_end_matches('/');
+        format!("{trimmed}/price/v3")
+    }
+}
 
 #[async_trait::async_trait]
 impl PriceOracle for JupiterPriceOracle {
@@ -33,40 +75,148 @@ impl PriceOracle for JupiterPriceOracle {
         client: &Client,
         mint_address: &str,
     ) -> Result<TokenPrice, KoraError> {
-        // Get price in SOL using vsToken parameter
-        let url = format!(
-            "{}/price?ids={}&vsToken=So11111111111111111111111111111111111111112",
-            std::env::var("JUPITER_API_URL").unwrap_or(JUPITER_API_URL.to_string()),
-            mint_address
-        );
+        let prices = self.get_prices(client, &[mint_address.to_string()]).await?;
 
-        let response = client
-            .get(&url)
-            .send()
-            .await
-            .map_err(|e| KoraError::RpcError(format!("Jupiter API request failed: {}", e)))?;
+        prices.get(mint_address).cloned().ok_or_else(|| {
+            KoraError::RpcError(format!("No price data from Jupiter for mint {mint_address}"))
+        })
+    }
 
-        if !response.status().is_success() {
-            return Err(KoraError::RpcError(format!("Jupiter API error: {}", response.status())));
+    async fn get_prices(
+        &self,
+        client: &Client,
+        mint_addresses: &[String],
+    ) -> Result<HashMap<String, TokenPrice>, KoraError> {
+        if mint_addresses.is_empty() {
+            return Ok(HashMap::new());
         }
 
-        let jupiter_response: JupiterResponse = response
-            .json()
-            .await
-            .map_err(|e| KoraError::RpcError(format!("Failed to parse Jupiter response: {}", e)))?;
+        self.fetch_prices_from_url(client, &self.api_url, mint_addresses, &self.api_key).await
+    }
+}
 
-        let price_data = jupiter_response
-            .data
-            .get(mint_address)
-            .ok_or_else(|| KoraError::RpcError("No price data from Jupiter".to_string()))?;
+impl JupiterPriceOracle {
+    fn validate_price_data(price_data: &JupiterPriceData, mint: &str) -> Result<(), KoraError> {
+        let price = price_data.usd_price;
 
-        // Convert price from string to f64
-        let price = price_data
-            .price
-            .parse::<f64>()
-            .map_err(|e| KoraError::RpcError(format!("Failed to parse price: {}", e)))?;
+        math_validator::validate_division(price)?;
 
-        Ok(TokenPrice { price, confidence: 0.95, source: PriceSource::Jupiter })
+        // Sanity check: price should be within reasonable bounds
+        if price > MAX_REASONABLE_PRICE {
+            log::error!(
+                "Price data for mint {} exceeds reasonable bounds: {} > {}",
+                mint,
+                price,
+                MAX_REASONABLE_PRICE
+            );
+            return Err(KoraError::RpcError(format!(
+                "Price data for mint {} exceeds reasonable bounds",
+                mint
+            )));
+        }
+
+        if price < MIN_REASONABLE_PRICE {
+            log::error!(
+                "Price data for mint {} below reasonable bounds: {} < {}",
+                mint,
+                price,
+                MIN_REASONABLE_PRICE
+            );
+            return Err(KoraError::RpcError(format!(
+                "Price data for mint {} below reasonable bounds",
+                mint
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn fetch_prices_from_url(
+        &self,
+        client: &Client,
+        api_url: &str,
+        mint_addresses: &[String],
+        api_key: &str,
+    ) -> Result<HashMap<String, TokenPrice>, KoraError> {
+        if mint_addresses.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut all_mints = vec![SOL_MINT.to_string()];
+        all_mints.extend_from_slice(mint_addresses);
+        let ids = all_mints.join(",");
+
+        let url = format!("{api_url}?ids={ids}");
+
+        let request = client.get(&url).header(JUPITER_AUTH_HEADER, api_key);
+
+        let response = request.send().await.map_err(|e| {
+            KoraError::RpcError(format!("Jupiter API request failed: {}", sanitize_error!(e)))
+        })?;
+
+        if !response.status().is_success() {
+            match response.status() {
+                StatusCode::TOO_MANY_REQUESTS => {
+                    return Err(KoraError::RateLimitExceeded);
+                }
+                _ => {
+                    return Err(KoraError::RpcError(format!(
+                        "Jupiter API error: {}",
+                        response.status()
+                    )));
+                }
+            }
+        }
+
+        let jupiter_response: JupiterResponse = response.json().await.map_err(|e| {
+            KoraError::RpcError(format!("Failed to parse Jupiter response: {}", sanitize_error!(e)))
+        })?;
+
+        // Get SOL price for conversion
+        let sol_price = jupiter_response
+            .get(SOL_MINT)
+            .ok_or_else(|| KoraError::RpcError("No SOL price data from Jupiter".to_string()))?;
+
+        Self::validate_price_data(sol_price, SOL_MINT)?;
+
+        let mut result = HashMap::new();
+        for mint_address in mint_addresses {
+            if let Some(price_data) = jupiter_response.get(mint_address.as_str()) {
+                Self::validate_price_data(price_data, mint_address)?;
+
+                // Convert f64 USD prices to Decimal at API boundary
+                let token_usd =
+                    Decimal::from_f64_retain(price_data.usd_price).ok_or_else(|| {
+                        KoraError::RpcError(format!("Invalid token price for mint {mint_address}"))
+                    })?;
+                let sol_usd = Decimal::from_f64_retain(sol_price.usd_price).ok_or_else(|| {
+                    KoraError::RpcError("Invalid SOL price from Jupiter".to_string())
+                })?;
+
+                let price_in_sol = token_usd / sol_usd;
+
+                result.insert(
+                    mint_address.clone(),
+                    TokenPrice {
+                        price: price_in_sol,
+                        confidence: JUPITER_DEFAULT_CONFIDENCE,
+                        source: PriceSource::Jupiter,
+                        block_id: Some(std::cmp::min(price_data.block_id, sol_price.block_id)),
+                    },
+                );
+            } else {
+                log::error!("No price data for mint {mint_address} from Jupiter");
+                return Err(KoraError::RpcError(format!(
+                    "No price data from Jupiter for mint {mint_address}"
+                )));
+            }
+        }
+
+        if result.is_empty() {
+            return Err(KoraError::RpcError("No price data from Jupiter".to_string()));
+        }
+
+        Ok(result)
     }
 }
 
@@ -74,42 +224,223 @@ impl PriceOracle for JupiterPriceOracle {
 mod tests {
     use super::*;
     use mockito::{Matcher, Server};
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn test_new_fails_without_api_key() {
+        std::env::remove_var("JUPITER_API_KEY");
+        {
+            let mut api_key_guard = GLOBAL_JUPITER_API_KEY.write();
+            *api_key_guard = None;
+        }
+
+        let result = JupiterPriceOracle::new();
+        assert!(result.is_err());
+        assert!(matches!(result.err(), Some(KoraError::ConfigError(_))));
+    }
 
     #[tokio::test]
-    async fn test_jupiter_price_fetch() {
+    #[serial]
+    async fn test_jupiter_price_fetch_with_api_key() {
+        {
+            let mut api_key_guard = GLOBAL_JUPITER_API_KEY.write();
+            *api_key_guard = Some("test-api-key".to_string());
+        }
+
         let mock_response = r#"{
-            "data": {
-                "So11111111111111111111111111111111111111112": {
-                    "id": "So11111111111111111111111111111111111111112",
-                    "type": "derivedPrice",
-                    "price": "1"
-                },
-                "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN": {
-                    "id": "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN",
-                    "type": "derivedPrice",
-                    "price": "0.005321503266927636"
-                }
+            "So11111111111111111111111111111111111111112": {
+                "usdPrice": 100.0,
+                "blockId": 12345,
+                "decimals": 9,
+                "priceChange24h": 2.5
             },
-            "timeTaken": 0.003297425
+            "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN": {
+                "usdPrice": 0.532,
+                "blockId": 12345,
+                "decimals": 6,
+                "priceChange24h": -1.2
+            }
         }"#;
+
         let mut server = Server::new_async().await;
         let _m = server
-            .mock("GET", "/price")
+            .mock("GET", "/price/v3")
+            .match_header("x-api-key", "test-api-key")
             .match_query(Matcher::Any)
             .with_status(200)
             .with_header("content-type", "application/json")
             .with_body(mock_response)
             .create();
-        let url = server.url();
-        std::env::set_var("JUPITER_API_URL", &url);
 
         let client = Client::new();
-        let oracle = JupiterPriceOracle;
-        let result = oracle.get_price(&client, "So11111111111111111111111111111111111111112").await;
+        let mut oracle = JupiterPriceOracle::new().unwrap();
+        oracle.api_url = format!("{}/price/v3", server.url());
 
+        let result = oracle.get_price(&client, "So11111111111111111111111111111111111111112").await;
         assert!(result.is_ok());
         let price = result.unwrap();
-        assert_eq!(price.price, 1.0);
+        assert_eq!(price.price, Decimal::from(1));
         assert_eq!(price.source, PriceSource::Jupiter);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_jupiter_missing_price_data_returns_error() {
+        {
+            let mut api_key_guard = GLOBAL_JUPITER_API_KEY.write();
+            *api_key_guard = Some("test-api-key".to_string());
+        }
+
+        let no_price_response = r#"{
+            "So11111111111111111111111111111111111111112": {
+                "usdPrice": 100.0,
+                "blockId": 12345,
+                "decimals": 9,
+                "priceChange24h": 2.5
+            }
+        }"#;
+
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/price/v3")
+            .match_header("x-api-key", "test-api-key")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(no_price_response)
+            .create();
+
+        let client = Client::new();
+        let mut oracle = JupiterPriceOracle::new().unwrap();
+        oracle.api_url = format!("{}/price/v3", server.url());
+
+        let result = oracle.get_price(&client, "JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN").await;
+        assert!(result.is_err());
+        assert_eq!(
+            result.err(),
+            Some(KoraError::RpcError(
+                "No price data from Jupiter for mint JUPyiwrYJFskUPiHa7hkeR8VUtAeFoSYbKedZNsDvCN"
+                    .to_string()
+            ))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_jupiter_rate_limit_429() {
+        {
+            let mut api_key_guard = GLOBAL_JUPITER_API_KEY.write();
+            *api_key_guard = Some("test-api-key".to_string());
+        }
+
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/price/v3")
+            .match_header("x-api-key", "test-api-key")
+            .match_query(Matcher::Any)
+            .with_status(429)
+            .with_body("Too Many Requests")
+            .create();
+
+        let client = Client::new();
+        let mut oracle = JupiterPriceOracle::new().unwrap();
+        oracle.api_url = format!("{}/price/v3", server.url());
+
+        let result = oracle
+            .get_prices(&client, &["So11111111111111111111111111111111111111112".to_string()])
+            .await;
+        assert!(result.is_err());
+        assert_eq!(result.err(), Some(KoraError::RateLimitExceeded));
+    }
+    #[tokio::test]
+    #[serial]
+    async fn test_jupiter_price_exceeds_max_bounds() {
+        {
+            let mut api_key_guard = GLOBAL_JUPITER_API_KEY.write();
+            *api_key_guard = Some("test-api-key".to_string());
+        }
+
+        let mock_response = r#"{
+            "So11111111111111111111111111111111111111112": {
+                "usdPrice": 100.0,
+                "blockId": 12345,
+                "decimals": 9,
+                "priceChange24h": 2.5
+            },
+            "TokenMintExceedsMaxBounds1111111111111111": {
+                "usdPrice": 9999999.0,
+                "blockId": 12345,
+                "decimals": 6,
+                "priceChange24h": 0.0
+            }
+        }"#;
+
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/price/v3")
+            .match_header("x-api-key", "test-api-key")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(mock_response)
+            .create();
+
+        let client = Client::new();
+        let mut oracle = JupiterPriceOracle::new().unwrap();
+        oracle.api_url = format!("{}/price/v3", server.url());
+
+        let result = oracle
+            .get_prices(&client, &["TokenMintExceedsMaxBounds1111111111111111".to_string()])
+            .await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.err(), Some(KoraError::RpcError(msg)) if msg.contains("exceeds reasonable bounds"))
+        );
+    }
+    #[tokio::test]
+    #[serial]
+    async fn test_jupiter_price_below_min_bounds() {
+        {
+            let mut api_key_guard = GLOBAL_JUPITER_API_KEY.write();
+            *api_key_guard = Some("test-api-key".to_string());
+        }
+
+        let mock_response = r#"{
+            "So11111111111111111111111111111111111111112": {
+                "usdPrice": 100.0,
+                "blockId": 12345,
+                "decimals": 9,
+                "priceChange24h": 2.5
+            },
+            "TokenMintBelowMinBounds11111111111111111111": {
+                "usdPrice": 0.0000000001,
+                "blockId": 12345,
+                "decimals": 6,
+                "priceChange24h": 0.0
+            }
+        }"#;
+
+        let mut server = Server::new_async().await;
+        let _m = server
+            .mock("GET", "/price/v3")
+            .match_header("x-api-key", "test-api-key")
+            .match_query(Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(mock_response)
+            .create();
+
+        let client = Client::new();
+        let mut oracle = JupiterPriceOracle::new().unwrap();
+        oracle.api_url = format!("{}/price/v3", server.url());
+
+        let result = oracle
+            .get_prices(&client, &["TokenMintBelowMinBounds11111111111111111111".to_string()])
+            .await;
+        assert!(result.is_err());
+        assert!(
+            matches!(result.err(), Some(KoraError::RpcError(msg)) if msg.contains("below reasonable bounds"))
+        );
     }
 }

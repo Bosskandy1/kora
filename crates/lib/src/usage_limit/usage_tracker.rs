@@ -1,0 +1,1315 @@
+use std::{cmp::min, collections::HashSet, sync::Arc, time::SystemTime};
+
+use super::{
+    limiter::{LimiterContext, LimiterResult},
+    rules::{InstructionRule, UsageRule},
+    usage_store::{InMemoryUsageStore, RedisUsageStore},
+    UsageStore,
+};
+use crate::{
+    cache::CacheUtil,
+    config::Config,
+    error::KoraError,
+    sanitize_error,
+    token::token::TokenType,
+    transaction::{
+        ParsedSPLInstructionData, ParsedSPLInstructionType, VersionedTransactionOps,
+        VersionedTransactionResolved,
+    },
+};
+use deadpool_redis::Runtime;
+use redis::AsyncCommands;
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::{program_pack::Pack, pubkey::Pubkey};
+use tokio::sync::OnceCell;
+
+#[cfg(not(test))]
+use crate::state::get_config;
+
+#[cfg(test)]
+use crate::tests::config_mock::mock_state::get_config;
+
+/// Global usage limiter instance
+static USAGE_LIMITER: OnceCell<Option<UsageTracker>> = OnceCell::const_new();
+
+pub struct UsageTracker {
+    enabled: bool,
+    store: Arc<dyn UsageStore>,
+    rules: Vec<UsageRule>,
+    fallback_if_unavailable: bool,
+}
+
+impl UsageTracker {
+    pub fn new(
+        enabled: bool,
+        store: Arc<dyn UsageStore>,
+        rules: Vec<UsageRule>,
+        fallback_if_unavailable: bool,
+    ) -> Self {
+        Self { enabled, store, rules, fallback_if_unavailable }
+    }
+
+    fn get_usage_limiter() -> Result<Option<&'static UsageTracker>, KoraError> {
+        match USAGE_LIMITER.get() {
+            Some(limiter) => Ok(limiter.as_ref()),
+            None => {
+                Err(KoraError::InternalServerError("Usage limiter not initialized".to_string()))
+            }
+        }
+    }
+
+    fn is_enabled(&self) -> bool {
+        self.enabled && !self.rules.is_empty()
+    }
+
+    fn has_instruction_rules(&self) -> bool {
+        self.rules.iter().any(|rule| rule.as_instruction().is_some())
+    }
+
+    async fn owner_signed_or_authorized_by_multisig(
+        owner: &Pubkey,
+        multisig_signers: &[Pubkey],
+        is_2022: bool,
+        verified_signers: &HashSet<Pubkey>,
+        config: &Config,
+        rpc_client: &RpcClient,
+    ) -> Result<bool, KoraError> {
+        if verified_signers.contains(owner) {
+            return Ok(true);
+        }
+
+        if multisig_signers.is_empty() {
+            return Ok(false);
+        }
+
+        let owner_account = match CacheUtil::get_account(config, rpc_client, owner, true).await {
+            Ok(account) => account,
+            Err(KoraError::AccountNotFound(_)) => return Ok(false),
+            Err(err) => return Err(err),
+        };
+
+        let verified_instruction_signers: HashSet<_> = multisig_signers
+            .iter()
+            .copied()
+            .filter(|signer| verified_signers.contains(signer))
+            .collect();
+
+        if verified_instruction_signers.is_empty() {
+            return Ok(false);
+        }
+
+        let multisig = if is_2022 {
+            if owner_account.owner != spl_token_2022_interface::id() {
+                return Ok(false);
+            }
+
+            spl_token_2022_interface::state::Multisig::unpack(&owner_account.data)
+                .map(|multisig| (multisig.m, multisig.n, multisig.signers))
+        } else {
+            if owner_account.owner != spl_token_interface::id() {
+                return Ok(false);
+            }
+
+            spl_token_interface::state::Multisig::unpack(&owner_account.data)
+                .map(|multisig| (multisig.m, multisig.n, multisig.signers))
+        };
+
+        let Ok((required_signers, signer_count, signers)) = multisig else {
+            return Ok(false);
+        };
+
+        let multisig_members: HashSet<Pubkey> = signers
+            .iter()
+            .take(signer_count as usize)
+            .copied()
+            .filter(|signer| *signer != Pubkey::default())
+            .collect();
+
+        Ok(verified_instruction_signers.intersection(&multisig_members).count()
+            >= required_signers as usize)
+    }
+
+    async fn extract_user_from_payment_instruction(
+        &self,
+        transaction: &mut VersionedTransactionResolved,
+        config: &Config,
+        fee_payer: &Pubkey,
+        rpc_client: &RpcClient,
+    ) -> Result<Option<Pubkey>, KoraError> {
+        let payment_destination = config.kora.get_payment_address(fee_payer)?;
+        let verified_signers = transaction.verified_signers();
+        let parsed_spl_instructions = transaction.get_or_parse_spl_instructions()?;
+
+        for instruction in parsed_spl_instructions
+            .get(&ParsedSPLInstructionType::SplTokenTransfer)
+            .unwrap_or(&vec![])
+        {
+            if let ParsedSPLInstructionData::SplTokenTransfer {
+                source_address,
+                destination_address,
+                owner,
+                multisig_signers,
+                is_2022,
+                ..
+            } = instruction
+            {
+                // Check if this is a payment to Kora by verifying the destination token account owner
+                // matches the payment destination
+                let destination_account =
+                    match CacheUtil::get_account(config, rpc_client, destination_address, true)
+                        .await
+                    {
+                        Ok(account) => account,
+                        Err(KoraError::AccountNotFound(_)) => continue,
+                        Err(e) => return Err(e),
+                    };
+
+                let token_program =
+                    TokenType::get_token_program_from_owner(&destination_account.owner)?;
+                let token_account =
+                    token_program.unpack_token_account(&destination_account.data)?;
+
+                if token_account.owner() == payment_destination
+                    && Self::owner_signed_or_authorized_by_multisig(
+                        owner,
+                        multisig_signers,
+                        *is_2022,
+                        &verified_signers,
+                        config,
+                        rpc_client,
+                    )
+                    .await?
+                {
+                    // Key usage by the funding wallet (the source token account's owner), not the
+                    // transfer authority, which can be a rotatable delegate or multisig member.
+                    let source_account =
+                        CacheUtil::get_account(config, rpc_client, source_address, true).await?;
+                    let source_token_program =
+                        TokenType::get_token_program_from_owner(&source_account.owner)?;
+                    let source_token_account =
+                        source_token_program.unpack_token_account(&source_account.data)?;
+                    return Ok(Some(source_token_account.owner()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn current_timestamp() -> u64 {
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    }
+
+    /// Check and record usage for a transaction.
+    /// Uses batch checking for all-or-nothing increments across multiple rules.
+    async fn check_and_record(
+        &self,
+        ctx: &mut LimiterContext<'_>,
+    ) -> Result<LimiterResult, KoraError> {
+        if !self.is_enabled() {
+            return Ok(LimiterResult::Allowed);
+        }
+
+        let instruction_rules: Vec<&InstructionRule> =
+            self.rules.iter().filter_map(UsageRule::as_instruction).collect();
+        let mut instruction_counts =
+            InstructionRule::count_all_rules(&instruction_rules, ctx).into_iter();
+
+        let mut pending_increments = Vec::with_capacity(self.rules.len());
+
+        // Refresh the timestamp just before touching the store. The value captured when the
+        // LimiterContext was created can be seconds stale after validation and RPC, which would
+        // push the window expiry into the past and let the store immediately expire the bucket,
+        // bypassing the limit.
+        ctx.timestamp = Self::current_timestamp();
+
+        for rule in &self.rules {
+            let increment_count = match rule {
+                UsageRule::Instruction(_) => instruction_counts
+                    .next()
+                    .expect("count_all_rules returns one count per instruction rule"),
+                UsageRule::Transaction(_) => 1,
+            };
+            if increment_count == 0 {
+                continue;
+            }
+
+            let key = rule.storage_key(&ctx.user_id, ctx.timestamp);
+            let expiry =
+                rule.window_seconds().filter(|&w| w > 0).map(|w| (ctx.timestamp / w + 1) * w);
+            let max = rule.max();
+            let description = rule.description();
+
+            // fast path: skip check_and_increment if already over limit
+            let current = self.store.get(&key).await?;
+
+            if current as u64 + increment_count > max {
+                return Ok(LimiterResult::Denied {
+                    reason: format!(
+                        "User {} exceeded {} limit: {}/{}",
+                        ctx.user_id,
+                        description,
+                        current as u64 + increment_count,
+                        max
+                    ),
+                });
+            }
+
+            pending_increments.push((key, increment_count, max, expiry, description));
+        }
+
+        if !pending_increments.is_empty() {
+            let mut unique_pending = Vec::new();
+            for (key, delta, max, expiry, desc) in pending_increments {
+                if let Some(existing) = unique_pending.iter_mut().find(
+                    |(k, _, _, _, _): &&mut (String, u64, u64, Option<u64>, String)| *k == key,
+                ) {
+                    existing.1 += delta;
+                    existing.2 = min(existing.2, max);
+                } else {
+                    unique_pending.push((key, delta, max, expiry, desc));
+                }
+            }
+            let pending_increments = unique_pending;
+
+            let entries: Vec<_> =
+                pending_increments.iter().map(|(k, d, m, e, _)| (k.clone(), *d, *m, *e)).collect();
+
+            if !self.store.check_and_increment_many(&entries).await? {
+                for (key, delta, max, _expiry, description) in &pending_increments {
+                    let current = self.store.get(key).await?;
+                    if current as u64 + delta > *max {
+                        return Ok(LimiterResult::Denied {
+                            reason: format!(
+                                "User {} exceeded {} limit: {}/{}",
+                                ctx.user_id,
+                                description,
+                                current as u64 + delta,
+                                max
+                            ),
+                        });
+                    }
+                }
+                return Ok(LimiterResult::Denied {
+                    reason: format!("User {} exceeded usage limit", ctx.user_id),
+                });
+            }
+        }
+
+        Ok(LimiterResult::Allowed)
+    }
+
+    pub async fn init_usage_limiter() -> Result<(), KoraError> {
+        let config = get_config()?;
+        let usage_config = &config.kora.usage_limit;
+
+        let set_limiter = |limiter| {
+            USAGE_LIMITER.set(limiter).map_err(|_| {
+                KoraError::InternalServerError("Usage limiter already initialized".to_string())
+            })
+        };
+
+        if !usage_config.enabled {
+            log::info!("Usage limiting disabled");
+            return set_limiter(None);
+        }
+
+        let rules = usage_config.build_rules()?;
+        if rules.is_empty() {
+            log::info!("Usage limiting enabled but no rules configured - disabled");
+            return set_limiter(None);
+        }
+
+        let resolved_cache_url = usage_config.resolved_cache_url();
+        let (store, backend): (Arc<dyn UsageStore>, &str) =
+            if let Some(cache_url) = &resolved_cache_url {
+                let cfg = deadpool_redis::Config::from_url(cache_url);
+                let pool = cfg.create_pool(Some(Runtime::Tokio1)).map_err(|e| {
+                    KoraError::InternalServerError(format!(
+                        "Failed to create Redis pool: {}",
+                        sanitize_error!(e)
+                    ))
+                })?;
+
+                let mut conn = pool.get().await.map_err(|e| {
+                    KoraError::InternalServerError(format!(
+                        "Failed to connect to Redis: {}",
+                        sanitize_error!(e)
+                    ))
+                })?;
+
+                let _: Option<String> = conn.get("__usage_limiter_test__").await.map_err(|e| {
+                    KoraError::InternalServerError(format!(
+                        "Redis connection test failed: {}",
+                        sanitize_error!(e)
+                    ))
+                })?;
+
+                (Arc::new(RedisUsageStore::new(pool)), "Redis")
+            } else {
+                log::warn!(
+                    "Usage limiting configured with in-memory store. \
+                     Limits will NOT be shared across instances and will reset on restart. \
+                     Configure 'cache_url' in [kora.usage_limit] for production deployments."
+                );
+                (Arc::new(InMemoryUsageStore::new()), "in-memory")
+            };
+
+        log::info!("Usage limiting initialized with {} rules ({backend})", rules.len());
+
+        set_limiter(Some(UsageTracker::new(
+            usage_config.enabled,
+            store,
+            rules,
+            usage_config.fallback_if_unavailable,
+        )))
+    }
+
+    pub async fn check_transaction_usage_limit(
+        config: &Config,
+        transaction: &mut VersionedTransactionResolved,
+        user_id: Option<&str>,
+        fee_payer: &Pubkey,
+        rpc_client: &RpcClient,
+    ) -> Result<(), KoraError> {
+        // Validate user_id is provided when required
+        if config.kora.usage_limit.enabled
+            && matches!(&config.validation.price.model, crate::fee::price::PriceModel::Free)
+            && user_id.is_none()
+        {
+            return Err(KoraError::ValidationError(
+                "user_id is required when usage tracking is enabled and pricing is free"
+                    .to_string(),
+            ));
+        }
+
+        let Some(tracker) = Self::get_usage_limiter()? else {
+            if config.kora.usage_limit.enabled && !config.kora.usage_limit.fallback_if_unavailable {
+                return Err(KoraError::InternalServerError(
+                    "Usage limiter unavailable and fallback disabled".to_string(),
+                ));
+            }
+            return Ok(());
+        };
+
+        tracker.check_transaction(config, transaction, user_id, fee_payer, rpc_client).await
+    }
+
+    async fn check_transaction(
+        &self,
+        config: &Config,
+        transaction: &mut VersionedTransactionResolved,
+        user_id: Option<&str>,
+        fee_payer: &Pubkey,
+        rpc_client: &RpcClient,
+    ) -> Result<(), KoraError> {
+        if self.has_instruction_rules() {
+            transaction.get_or_parse_system_instructions()?;
+            transaction.get_or_parse_spl_instructions()?;
+        }
+
+        // Resolve user_id for usage tracking:
+        // - If user_id is provided, use it directly (works for both free and paid modes)
+        // - Otherwise (paid mode), extract payer from payment instruction
+        let resolved_user_id = if let Some(user_id_str) = user_id {
+            user_id_str.to_string()
+        } else {
+            // Paid mode: extract payer from payment instruction
+            self.extract_user_from_payment_instruction(transaction, config, fee_payer, rpc_client)
+                .await?
+                .ok_or_else(|| {
+                    KoraError::ValidationError(
+                        "Could not resolve user_id: no payment instruction found".to_string(),
+                    )
+                })?
+                .to_string()
+        };
+
+        // Bind usage accounting to the signer selected for this request (the signer Kora actually
+        // signs with), not whichever pool signer happens to appear first in the message.
+        let mut ctx = LimiterContext {
+            transaction,
+            user_id: resolved_user_id,
+            kora_signer: Some(*fee_payer),
+            timestamp: Self::current_timestamp(),
+        };
+
+        match self.check_and_record(&mut ctx).await {
+            Ok(LimiterResult::Allowed) => Ok(()),
+            Ok(LimiterResult::Denied { reason }) => Err(KoraError::UsageLimitExceeded(reason)),
+            Err(e)
+                if self.fallback_if_unavailable
+                    && matches!(e, KoraError::InternalServerError(_)) =>
+            {
+                log::warn!("Usage limiter error (fallback enabled): {e}");
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        tests::{
+            account_mock::create_mock_token_account, config_mock::ConfigMockBuilder,
+            rpc_mock::RpcMockBuilder, transaction_mock::create_mock_resolved_transaction,
+        },
+        transaction::TransactionUtil,
+        usage_limit::{InMemoryUsageStore, UsageLimitConfig, UsageLimitRuleConfig},
+    };
+    use async_trait::async_trait;
+    use solana_message::{Message, VersionedMessage};
+    use solana_sdk::{account::Account, signature::Keypair, signer::Signer};
+    use std::sync::Arc;
+
+    struct ConcurrentMockStore {
+        inner: InMemoryUsageStore,
+    }
+
+    impl ConcurrentMockStore {
+        fn new() -> Self {
+            Self { inner: InMemoryUsageStore::new() }
+        }
+    }
+
+    #[async_trait]
+    impl UsageStore for ConcurrentMockStore {
+        async fn increment(&self, key: &str) -> Result<u32, KoraError> {
+            tokio::task::yield_now().await;
+            self.inner.increment(key).await
+        }
+
+        async fn increment_with_expiry(
+            &self,
+            key: &str,
+            expires_at: u64,
+        ) -> Result<u32, KoraError> {
+            tokio::task::yield_now().await;
+            self.inner.increment_with_expiry(key, expires_at).await
+        }
+
+        async fn get(&self, key: &str) -> Result<u32, KoraError> {
+            tokio::task::yield_now().await;
+            self.inner.get(key).await
+        }
+
+        async fn clear(&self) -> Result<(), KoraError> {
+            self.inner.clear().await
+        }
+
+        async fn check_and_increment(
+            &self,
+            key: &str,
+            delta: u64,
+            max: u64,
+            expiry: Option<u64>,
+        ) -> Result<bool, KoraError> {
+            tokio::task::yield_now().await;
+            self.inner.check_and_increment(key, delta, max, expiry).await
+        }
+
+        async fn check_and_increment_many(
+            &self,
+            entries: &[(String, u64, u64, Option<u64>)],
+        ) -> Result<bool, KoraError> {
+            tokio::task::yield_now().await;
+            self.inner.check_and_increment_many(entries).await
+        }
+    }
+
+    fn create_test_tracker(max_transactions: u64) -> UsageTracker {
+        let store = Arc::new(InMemoryUsageStore::new());
+        let config = UsageLimitConfig {
+            enabled: true,
+            cache_url: None,
+            fallback_if_unavailable: false,
+            rules: vec![UsageLimitRuleConfig::Transaction {
+                max: max_transactions,
+                window_seconds: None,
+            }],
+        };
+        let rules = config.build_rules().unwrap();
+        UsageTracker::new(true, store, rules, false)
+    }
+
+    #[tokio::test]
+    async fn test_usage_limit_enforcement() {
+        let tracker = create_test_tracker(2);
+        let user_id = "test-user-enforcement".to_string();
+
+        let mut tx1 = create_mock_resolved_transaction();
+        let mut ctx1 = LimiterContext {
+            transaction: &mut tx1,
+            user_id: user_id.clone(),
+            kora_signer: None,
+            timestamp: 1000000,
+        };
+
+        let mut tx2 = create_mock_resolved_transaction();
+        let mut ctx2 = LimiterContext {
+            transaction: &mut tx2,
+            user_id: user_id.clone(),
+            kora_signer: None,
+            timestamp: 1000000,
+        };
+
+        let mut tx3 = create_mock_resolved_transaction();
+        let mut ctx3 = LimiterContext {
+            transaction: &mut tx3,
+            user_id: user_id.clone(),
+            kora_signer: None,
+            timestamp: 1000000,
+        };
+
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx1).await.unwrap(),
+            LimiterResult::Allowed
+        ));
+
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx2).await.unwrap(),
+            LimiterResult::Allowed
+        ));
+
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx3).await.unwrap(),
+            LimiterResult::Denied { .. }
+        ));
+    }
+
+    fn create_windowed_test_tracker(max: u64, window_seconds: u64) -> UsageTracker {
+        let store = Arc::new(InMemoryUsageStore::new());
+        let config = UsageLimitConfig {
+            enabled: true,
+            cache_url: None,
+            fallback_if_unavailable: false,
+            rules: vec![UsageLimitRuleConfig::Transaction {
+                max,
+                window_seconds: Some(window_seconds),
+            }],
+        };
+        let rules = config.build_rules().unwrap();
+        UsageTracker::new(true, store, rules, false)
+    }
+
+    #[tokio::test]
+    async fn test_windowed_limit_not_bypassed_by_stale_timestamp() {
+        let window_seconds = 3600u64;
+        let tracker = create_windowed_test_tracker(1, window_seconds);
+        let user_id = "stale-window-user".to_string();
+
+        // A timestamp from two windows ago derives an already-past expiry; the tracker must
+        // refresh it at store time so the bucket stays live and the limit is still enforced.
+        let stale_timestamp = UsageTracker::current_timestamp().saturating_sub(window_seconds * 2);
+
+        let mut tx1 = create_mock_resolved_transaction();
+        let mut ctx1 = LimiterContext {
+            transaction: &mut tx1,
+            user_id: user_id.clone(),
+            kora_signer: None,
+            timestamp: stale_timestamp,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx1).await.unwrap(),
+            LimiterResult::Allowed
+        ));
+
+        let mut tx2 = create_mock_resolved_transaction();
+        let mut ctx2 = LimiterContext {
+            transaction: &mut tx2,
+            user_id: user_id.clone(),
+            kora_signer: None,
+            timestamp: stale_timestamp,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx2).await.unwrap(),
+            LimiterResult::Denied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_independent_user_limits() {
+        let tracker = create_test_tracker(2);
+
+        let user_id1 = "test-user-1".to_string();
+        let user_id2 = "test-user-2".to_string();
+
+        let mut tx1a = create_mock_resolved_transaction();
+        let mut ctx1a = LimiterContext {
+            transaction: &mut tx1a,
+            user_id: user_id1.clone(),
+            kora_signer: None,
+            timestamp: 1000000,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx1a).await.unwrap(),
+            LimiterResult::Allowed
+        ));
+        let mut tx1b = create_mock_resolved_transaction();
+        let mut ctx1b = LimiterContext {
+            transaction: &mut tx1b,
+            user_id: user_id1.clone(),
+            kora_signer: None,
+            timestamp: 1000000,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx1b).await.unwrap(),
+            LimiterResult::Allowed
+        ));
+        let mut tx1c = create_mock_resolved_transaction();
+        let mut ctx1c = LimiterContext {
+            transaction: &mut tx1c,
+            user_id: user_id1.clone(),
+            kora_signer: None,
+            timestamp: 1000000,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx1c).await.unwrap(),
+            LimiterResult::Denied { .. }
+        ));
+
+        let mut tx2a = create_mock_resolved_transaction();
+        let mut ctx2a = LimiterContext {
+            transaction: &mut tx2a,
+            user_id: user_id2.clone(),
+            kora_signer: None,
+            timestamp: 1000000,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx2a).await.unwrap(),
+            LimiterResult::Allowed
+        ));
+        let mut tx2b = create_mock_resolved_transaction();
+        let mut ctx2b = LimiterContext {
+            transaction: &mut tx2b,
+            user_id: user_id2.clone(),
+            kora_signer: None,
+            timestamp: 1000000,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx2b).await.unwrap(),
+            LimiterResult::Allowed
+        ));
+        let mut tx2c = create_mock_resolved_transaction();
+        let mut ctx2c = LimiterContext {
+            transaction: &mut tx2c,
+            user_id: user_id2.clone(),
+            kora_signer: None,
+            timestamp: 1000000,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx2c).await.unwrap(),
+            LimiterResult::Denied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_unlimited_usage() {
+        let store = Arc::new(InMemoryUsageStore::new());
+        let config = UsageLimitConfig {
+            enabled: true,
+            cache_url: None,
+            fallback_if_unavailable: false,
+            rules: vec![], // No rules = unlimited
+        };
+        let rules = config.build_rules().unwrap();
+        let tracker = UsageTracker::new(true, store, rules, false);
+
+        let user_id = "test-user-unlimited".to_string();
+
+        for _ in 0..10 {
+            let mut tx = create_mock_resolved_transaction();
+            let mut ctx = LimiterContext {
+                transaction: &mut tx,
+                user_id: user_id.clone(),
+                kora_signer: None,
+                timestamp: 1000000,
+            };
+            assert!(matches!(
+                tracker.check_and_record(&mut ctx).await.unwrap(),
+                LimiterResult::Allowed
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_multiple_rules() {
+        let store: Arc<dyn UsageStore> = Arc::new(InMemoryUsageStore::new());
+
+        let config = UsageLimitConfig {
+            enabled: true,
+            cache_url: None,
+            fallback_if_unavailable: false,
+            rules: vec![
+                // Lifetime limit: 10 transactions
+                UsageLimitRuleConfig::Transaction { max: 10, window_seconds: None },
+                // Time bucket limit: 2 per 100 seconds
+                UsageLimitRuleConfig::Transaction { max: 2, window_seconds: Some(100) },
+            ],
+        };
+
+        let rules = config.build_rules().unwrap();
+        let tracker = UsageTracker::new(true, store, rules, false);
+
+        let user_id = "test-user-multiple-rules".to_string();
+        let now = UsageTracker::current_timestamp();
+
+        let mut tx1 = create_mock_resolved_transaction();
+        let mut ctx1 = LimiterContext {
+            transaction: &mut tx1,
+            user_id: user_id.clone(),
+            kora_signer: None,
+            timestamp: now,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx1).await.unwrap(),
+            LimiterResult::Allowed
+        ));
+        let mut tx2 = create_mock_resolved_transaction();
+        let mut ctx2 = LimiterContext {
+            transaction: &mut tx2,
+            user_id: user_id.clone(),
+            kora_signer: None,
+            timestamp: now,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx2).await.unwrap(),
+            LimiterResult::Allowed
+        ));
+
+        let mut tx3 = create_mock_resolved_transaction();
+        let mut ctx3 = LimiterContext {
+            transaction: &mut tx3,
+            user_id: user_id.clone(),
+            kora_signer: None,
+            timestamp: now,
+        };
+        assert!(matches!(
+            tracker.check_and_record(&mut ctx3).await.unwrap(),
+            LimiterResult::Denied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_usage_limiter_disabled_fallback() {
+        let _m = ConfigMockBuilder::new().with_usage_limit_enabled(false).build_and_setup();
+
+        // Initialize the usage limiter - it should set to None when disabled
+        let _ = UsageTracker::init_usage_limiter().await;
+
+        let config = get_config().unwrap();
+        let mut tx = create_mock_resolved_transaction();
+        let rpc_client = Arc::new(RpcMockBuilder::new().build());
+        let fee_payer = Pubkey::new_unique();
+        let result = UsageTracker::check_transaction_usage_limit(
+            &config,
+            &mut tx,
+            None,
+            &fee_payer,
+            &rpc_client,
+        )
+        .await;
+        match &result {
+            Ok(_) => {}
+            Err(e) => println!("Test failed with error: {e}"),
+        }
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_usage_limiter_fallback_allowed() {
+        let _m = ConfigMockBuilder::new()
+            .with_usage_limit_enabled(true)
+            .with_usage_limit_cache_url(None)
+            .with_usage_limit_fallback(true)
+            .build_and_setup();
+
+        let _ = UsageTracker::init_usage_limiter().await;
+
+        let config = get_config().unwrap();
+        let mut tx = create_mock_resolved_transaction();
+        let rpc_client = Arc::new(RpcMockBuilder::new().build());
+        let fee_payer = Pubkey::new_unique();
+        let result = UsageTracker::check_transaction_usage_limit(
+            &config,
+            &mut tx,
+            None,
+            &fee_payer,
+            &rpc_client,
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_usage_limiter_fallback_denied() {
+        let _m = ConfigMockBuilder::new()
+            .with_usage_limit_enabled(true)
+            .with_usage_limit_cache_url(None)
+            .with_usage_limit_fallback(false)
+            .build_and_setup();
+
+        let _ = UsageTracker::init_usage_limiter().await;
+
+        let config = get_config().unwrap();
+        let mut tx = create_mock_resolved_transaction();
+        let rpc_client = Arc::new(RpcMockBuilder::new().build());
+        let fee_payer = Pubkey::new_unique();
+        let result = UsageTracker::check_transaction_usage_limit(
+            &config,
+            &mut tx,
+            None,
+            &fee_payer,
+            &rpc_client,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Usage limiter unavailable and fallback disabled"));
+    }
+
+    #[tokio::test]
+    async fn test_usage_limit_binds_to_selected_signer_not_first_message_signer() {
+        let store: Arc<dyn UsageStore> = Arc::new(InMemoryUsageStore::new());
+        let rules = UsageLimitConfig {
+            enabled: true,
+            cache_url: None,
+            fallback_if_unavailable: false,
+            rules: vec![UsageLimitRuleConfig::Instruction {
+                program: solana_system_interface::program::ID.to_string(),
+                instruction: "CreateAccount".to_string(),
+                max: 3,
+                window_seconds: None,
+            }],
+        }
+        .build_rules()
+        .unwrap();
+        let tracker = UsageTracker::new(true, store, rules, false);
+
+        let config = ConfigMockBuilder::new().build();
+        let rpc_client = RpcMockBuilder::new().build();
+
+        let signer_a = Keypair::new();
+        let signer_b = Keypair::new();
+        let new_account = Keypair::new();
+
+        let build_tx = || {
+            let create_ix = solana_system_interface::instruction::create_account(
+                &signer_b.pubkey(),
+                &new_account.pubkey(),
+                1_000_000,
+                0,
+                &solana_system_interface::program::ID,
+            );
+            let message = Message::new(&[create_ix], Some(&signer_a.pubkey()));
+            TransactionUtil::new_unsigned_versioned_transaction_resolved(VersionedMessage::Legacy(
+                message,
+            ))
+            .unwrap()
+        };
+
+        for attempt in 1..=3 {
+            let mut tx = build_tx();
+            tracker
+                .check_transaction(
+                    &config,
+                    &mut tx,
+                    Some("user-b"),
+                    &signer_b.pubkey(),
+                    &rpc_client,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("request #{attempt} for signer_b should pass: {e}"));
+        }
+        let mut tx = build_tx();
+        let err = tracker
+            .check_transaction(&config, &mut tx, Some("user-b"), &signer_b.pubkey(), &rpc_client)
+            .await
+            .expect_err("4th request for signer_b must exceed the CreateAccount limit");
+        assert!(matches!(err, KoraError::UsageLimitExceeded(_)));
+
+        for attempt in 1..=5 {
+            let mut tx = build_tx();
+            tracker
+                .check_transaction(
+                    &config,
+                    &mut tx,
+                    Some("user-a"),
+                    &signer_a.pubkey(),
+                    &rpc_client,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("request #{attempt} for signer_a should pass: {e}"));
+        }
+    }
+
+    fn create_mock_spl_multisig_account(
+        required_signers: u8,
+        signer_pubkeys: &[Pubkey],
+    ) -> Account {
+        let mut multisig = spl_token_interface::state::Multisig {
+            m: required_signers,
+            n: signer_pubkeys.len() as u8,
+            is_initialized: true,
+            signers: [Pubkey::default(); spl_token_interface::instruction::MAX_SIGNERS],
+        };
+
+        for (slot, signer) in multisig.signers.iter_mut().zip(signer_pubkeys.iter().copied()) {
+            *slot = signer;
+        }
+
+        let mut data = vec![0u8; spl_token_interface::state::Multisig::LEN];
+        spl_token_interface::state::Multisig::pack(multisig, &mut data).unwrap();
+
+        Account {
+            lamports: 1,
+            data,
+            owner: spl_token_interface::id(),
+            executable: false,
+            rent_epoch: 0,
+        }
+    }
+
+    fn make_spl_transfer_transaction(
+        authority: &Pubkey,
+        instruction_signers: &[&Pubkey],
+        signing_keypairs: &[&Keypair],
+        destination_ata: Pubkey,
+        fee_payer: &Keypair,
+    ) -> VersionedTransactionResolved {
+        let ix = spl_token_interface::instruction::transfer(
+            &spl_token_interface::id(),
+            &Pubkey::new_unique(),
+            &destination_ata,
+            authority,
+            instruction_signers,
+            1_000_000,
+        )
+        .unwrap();
+
+        let message = VersionedMessage::Legacy(Message::new(&[ix], Some(&fee_payer.pubkey())));
+        let mut tx = TransactionUtil::new_unsigned_versioned_transaction(message);
+        let message_bytes = tx.message.serialize();
+
+        for keypair in signing_keypairs {
+            let signer_index = tx
+                .message
+                .static_account_keys()
+                .iter()
+                .position(|key| key == &keypair.pubkey())
+                .unwrap();
+            tx.signatures[signer_index] = keypair.sign_message(&message_bytes);
+        }
+
+        VersionedTransactionResolved::from_kora_built_transaction(&tx).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_extract_user_unsigned_owner_returns_none() {
+        let store = Arc::new(InMemoryUsageStore::new());
+        let tracker = UsageTracker::new(true, store, vec![], false);
+
+        let fee_payer = Keypair::new();
+        let victim_owner = Keypair::new();
+        let destination_ata = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let destination_account = create_mock_token_account(&fee_payer.pubkey(), &mint);
+        let rpc_client = RpcMockBuilder::new().with_account_info(&destination_account).build();
+        let config = ConfigMockBuilder::new().build();
+
+        let mut tx = make_spl_transfer_transaction(
+            &victim_owner.pubkey(),
+            &[],
+            &[],
+            destination_ata,
+            &fee_payer,
+        );
+
+        let result = tracker
+            .extract_user_from_payment_instruction(
+                &mut tx,
+                &config,
+                &fee_payer.pubkey(),
+                &rpc_client,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_extract_user_signed_owner_returns_owner() {
+        let store = Arc::new(InMemoryUsageStore::new());
+        let tracker = UsageTracker::new(true, store, vec![], false);
+
+        let fee_payer = Keypair::new();
+        let owner = Keypair::new();
+        let destination_ata = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let destination_account = create_mock_token_account(&fee_payer.pubkey(), &mint);
+        let source_account = create_mock_token_account(&owner.pubkey(), &mint);
+        let rpc_client = RpcMockBuilder::new()
+            .build_with_sequential_accounts(vec![&destination_account, &source_account]);
+        let config = ConfigMockBuilder::new().build();
+
+        let mut tx = make_spl_transfer_transaction(
+            &owner.pubkey(),
+            &[],
+            &[&owner],
+            destination_ata,
+            &fee_payer,
+        );
+
+        let result = tracker
+            .extract_user_from_payment_instruction(
+                &mut tx,
+                &config,
+                &fee_payer.pubkey(),
+                &rpc_client,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(owner.pubkey()));
+    }
+
+    #[tokio::test]
+    async fn test_extract_user_delegated_transfer_returns_source_owner_not_delegate() {
+        let store = Arc::new(InMemoryUsageStore::new());
+        let tracker = UsageTracker::new(true, store, vec![], false);
+
+        let fee_payer = Keypair::new();
+        let source_owner = Pubkey::new_unique();
+        let delegate = Keypair::new();
+        let destination_ata = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let destination_account = create_mock_token_account(&fee_payer.pubkey(), &mint);
+        let source_account = create_mock_token_account(&source_owner, &mint);
+        let rpc_client = RpcMockBuilder::new()
+            .build_with_sequential_accounts(vec![&destination_account, &source_account]);
+        let config = ConfigMockBuilder::new().build();
+
+        let mut tx = make_spl_transfer_transaction(
+            &delegate.pubkey(),
+            &[],
+            &[&delegate],
+            destination_ata,
+            &fee_payer,
+        );
+
+        let result = tracker
+            .extract_user_from_payment_instruction(
+                &mut tx,
+                &config,
+                &fee_payer.pubkey(),
+                &rpc_client,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(source_owner));
+        assert_ne!(result, Some(delegate.pubkey()));
+    }
+
+    #[tokio::test]
+    async fn test_extract_user_multisig_owner_returns_owner_when_threshold_is_met() {
+        let store = Arc::new(InMemoryUsageStore::new());
+        let tracker = UsageTracker::new(true, store, vec![], false);
+
+        let fee_payer = Keypair::new();
+        let signer_one = Keypair::new();
+        let signer_two = Keypair::new();
+        let signer_three = Keypair::new();
+        let multisig_owner = Pubkey::new_unique();
+        let destination_ata = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let destination_account = create_mock_token_account(&fee_payer.pubkey(), &mint);
+        let multisig_account = create_mock_spl_multisig_account(
+            2,
+            &[signer_one.pubkey(), signer_two.pubkey(), signer_three.pubkey()],
+        );
+        let source_account = create_mock_token_account(&multisig_owner, &mint);
+        let rpc_client = RpcMockBuilder::new().build_with_sequential_accounts(vec![
+            &destination_account,
+            &multisig_account,
+            &source_account,
+        ]);
+        let config = ConfigMockBuilder::new().build();
+
+        let mut tx = make_spl_transfer_transaction(
+            &multisig_owner,
+            &[&signer_one.pubkey(), &signer_two.pubkey()],
+            &[&signer_one, &signer_two],
+            destination_ata,
+            &fee_payer,
+        );
+
+        let result = tracker
+            .extract_user_from_payment_instruction(
+                &mut tx,
+                &config,
+                &fee_payer.pubkey(),
+                &rpc_client,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, Some(multisig_owner));
+    }
+
+    #[tokio::test]
+    async fn test_extract_user_multisig_owner_returns_none_when_threshold_is_not_met() {
+        let store = Arc::new(InMemoryUsageStore::new());
+        let tracker = UsageTracker::new(true, store, vec![], false);
+
+        let fee_payer = Keypair::new();
+        let signer_one = Keypair::new();
+        let signer_two = Keypair::new();
+        let signer_three = Keypair::new();
+        let multisig_owner = Pubkey::new_unique();
+        let destination_ata = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let destination_account = create_mock_token_account(&fee_payer.pubkey(), &mint);
+        let multisig_account = create_mock_spl_multisig_account(
+            2,
+            &[signer_one.pubkey(), signer_two.pubkey(), signer_three.pubkey()],
+        );
+        let rpc_client = RpcMockBuilder::new()
+            .build_with_sequential_accounts(vec![&destination_account, &multisig_account]);
+        let config = ConfigMockBuilder::new().build();
+
+        let mut tx = make_spl_transfer_transaction(
+            &multisig_owner,
+            &[&signer_one.pubkey(), &signer_two.pubkey()],
+            &[&signer_one],
+            destination_ata,
+            &fee_payer,
+        );
+
+        let result = tracker
+            .extract_user_from_payment_instruction(
+                &mut tx,
+                &config,
+                &fee_payer.pubkey(),
+                &rpc_client,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_requests_enforce_limit() {
+        let max = 5;
+        let store = Arc::new(ConcurrentMockStore::new());
+        let config = UsageLimitConfig {
+            enabled: true,
+            cache_url: None,
+            fallback_if_unavailable: false,
+            rules: vec![UsageLimitRuleConfig::Transaction { max, window_seconds: None }],
+        };
+        let rules = config.build_rules().unwrap();
+        let tracker = Arc::new(UsageTracker::new(true, store, rules, false));
+        let user_id = "concurrent-user".to_string();
+        let mut handles = Vec::new();
+
+        for _ in 0..10 {
+            let tracker = tracker.clone();
+            let user_id = user_id.clone();
+            handles.push(tokio::spawn(async move {
+                let mut tx = create_mock_resolved_transaction();
+                let mut ctx = LimiterContext {
+                    transaction: &mut tx,
+                    user_id,
+                    kora_signer: None,
+                    timestamp: 1000000,
+                };
+                tracker.check_and_record(&mut ctx).await.unwrap()
+            }));
+        }
+
+        let mut allowed_count = 0;
+        for handle in handles {
+            if matches!(handle.await.unwrap(), LimiterResult::Allowed) {
+                allowed_count += 1;
+            }
+        }
+
+        assert_eq!(allowed_count, max as usize);
+    }
+
+    #[tokio::test]
+    async fn test_multi_rule_concurrent_enforces_bottleneck_rule() {
+        let store = Arc::new(ConcurrentMockStore::new());
+        let config = UsageLimitConfig {
+            enabled: true,
+            cache_url: None,
+            fallback_if_unavailable: false,
+            rules: vec![
+                UsageLimitRuleConfig::Transaction { max: 10, window_seconds: None },
+                UsageLimitRuleConfig::Transaction { max: 2, window_seconds: Some(60) },
+            ],
+        };
+        let rules = config.build_rules().unwrap();
+        let tracker = Arc::new(UsageTracker::new(true, store.clone(), rules, false));
+        let user_id = "multi-rule-concurrent-user".to_string();
+        let mut handles = Vec::new();
+
+        for _ in 0..10 {
+            let tracker = tracker.clone();
+            let user_id = user_id.clone();
+            handles.push(tokio::spawn(async move {
+                let mut tx = create_mock_resolved_transaction();
+                let mut ctx = LimiterContext {
+                    transaction: &mut tx,
+                    user_id,
+                    kora_signer: None,
+                    timestamp: UsageTracker::current_timestamp(),
+                };
+                tracker.check_and_record(&mut ctx).await.unwrap()
+            }));
+        }
+
+        let mut allowed_count = 0;
+        for handle in handles {
+            if matches!(handle.await.unwrap(), LimiterResult::Allowed) {
+                allowed_count += 1;
+            }
+        }
+
+        assert_eq!(allowed_count, 2);
+
+        let lifetime_key = "kora:tx:multi-rule-concurrent-user";
+        let lifetime_count = store.get(lifetime_key).await.unwrap();
+        assert_eq!(lifetime_count, allowed_count as u32);
+    }
+
+    #[tokio::test]
+    async fn test_check_and_increment_many_all_or_nothing() {
+        let store = InMemoryUsageStore::new();
+
+        let entries = vec![("key1".to_string(), 1, 5, None), ("key2".to_string(), 1, 1, None)];
+
+        // First call should succeed
+        let result1 = store.check_and_increment_many(&entries).await.unwrap();
+        assert!(result1);
+
+        assert_eq!(store.get("key1").await.unwrap(), 1);
+        assert_eq!(store.get("key2").await.unwrap(), 1);
+
+        // Second call should fail because key2 would exceed its max of 1
+        let result2 = store.check_and_increment_many(&entries).await.unwrap();
+        assert!(!result2);
+
+        // All-or-nothing: key1 should not be incremented
+        assert_eq!(store.get("key1").await.unwrap(), 1);
+        assert_eq!(store.get("key2").await.unwrap(), 1);
+    }
+}

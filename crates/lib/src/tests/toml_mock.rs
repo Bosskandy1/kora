@@ -1,0 +1,383 @@
+use std::fs;
+use tempfile::NamedTempFile;
+
+use crate::{
+    config::{Config, SplTokenConfig},
+    error::KoraError,
+};
+
+/// Rule config for TOML generation
+/// For transaction rules: (None, None, max, window_seconds)
+/// For instruction rules: (Some(program), Some(instruction), max, window_seconds)
+type UsageLimitRuleTuple<'a> = (Option<&'a str>, Option<&'a str>, u64, Option<u64>);
+
+/// TOML-specific configuration builder for testing TOML parsing and serialization
+///
+/// This builder is specifically designed for testing TOML file generation and parsing.
+/// For direct Config object creation in tests, use `config_mock::ConfigMockBuilder` instead.
+///
+/// Key differences:
+/// - This builder generates TOML strings via `build_toml()`
+/// - Used primarily for testing config file parsing logic
+/// - Validates TOML parsing and deserialization
+#[derive(Default)]
+pub struct ConfigBuilder {
+    validation: ValidationSection,
+    kora: KoraSection,
+    custom_sections: Vec<String>,
+}
+
+struct ValidationSection {
+    max_allowed_lamports: u64,
+    max_signatures: u64,
+    allowed_programs: Vec<String>,
+    require_one_of_programs: Vec<String>,
+    allowed_tokens: Vec<String>,
+    allowed_spl_paid_tokens: SplTokenConfig,
+    disallowed_accounts: Vec<String>,
+    price_source: String,
+    price_config: Option<String>,
+    token_2022_config: Option<String>,
+}
+
+struct KoraSection {
+    rate_limit: u64,
+    max_request_body_size: Option<usize>,
+    enabled_methods: Option<String>,
+    cache_config: Option<String>,
+    usage_limit_config: Option<String>,
+    sign_timeout_seconds: Option<u64>,
+    sign_max_retries: Option<u32>,
+}
+
+impl Default for ValidationSection {
+    fn default() -> Self {
+        Self {
+            max_allowed_lamports: 1000000000,
+            max_signatures: 10,
+            allowed_programs: vec!["program1".to_string()],
+            require_one_of_programs: vec![],
+            allowed_tokens: vec!["token1".to_string()],
+            allowed_spl_paid_tokens: SplTokenConfig::Allowlist(vec!["token2".to_string()]),
+            disallowed_accounts: vec![],
+            price_source: "Jupiter".to_string(),
+            price_config: None,
+            token_2022_config: None,
+        }
+    }
+}
+
+impl Default for KoraSection {
+    fn default() -> Self {
+        Self {
+            rate_limit: 100,
+            max_request_body_size: None,
+            enabled_methods: None,
+            cache_config: None,
+            usage_limit_config: None,
+            sign_timeout_seconds: None,
+            sign_max_retries: None,
+        }
+    }
+}
+
+impl ConfigBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_programs(mut self, programs: Vec<&str>) -> Self {
+        self.validation.allowed_programs = programs.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_require_one_of_programs(mut self, programs: Vec<&str>) -> Self {
+        self.validation.require_one_of_programs = programs.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_tokens(mut self, tokens: Vec<&str>) -> Self {
+        self.validation.allowed_tokens = tokens.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_spl_paid_tokens(mut self, spl_payment_config: SplTokenConfig) -> Self {
+        self.validation.allowed_spl_paid_tokens = spl_payment_config;
+        self
+    }
+
+    pub fn with_disallowed_accounts(mut self, accounts: Vec<&str>) -> Self {
+        self.validation.disallowed_accounts = accounts.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    pub fn with_margin_price(mut self, margin: f64) -> Self {
+        self.validation.price_config =
+            Some(format!("[validation.price]\ntype = \"margin\"\nmargin = {margin}\n"));
+        self
+    }
+
+    pub fn with_fixed_price(mut self, amount: u64, token: &str) -> Self {
+        self.validation.price_config = Some(format!(
+            "[validation.price]\ntype = \"fixed\"\namount = {amount}\ntoken = \"{token}\"\nstrict = false\n"
+        ));
+        self
+    }
+
+    pub fn with_free_price(mut self) -> Self {
+        self.validation.price_config = Some("[validation.price]\ntype = \"free\"\n".to_string());
+        self
+    }
+
+    pub fn with_invalid_price(mut self, price_type: &str) -> Self {
+        self.validation.price_config =
+            Some(format!("[validation.price]\ntype = \"{price_type}\"\nmargin = 0.1\n"));
+        self
+    }
+
+    pub fn with_token2022_extensions(
+        mut self,
+        mint_exts: Vec<&str>,
+        account_exts: Vec<&str>,
+    ) -> Self {
+        let mint_list =
+            mint_exts.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
+        let account_list =
+            account_exts.iter().map(|ext| format!("\"{ext}\"")).collect::<Vec<_>>().join(", ");
+
+        self.validation.token_2022_config = Some(format!(
+            "[validation.token_2022]\nblocked_mint_extensions = [{mint_list}]\nblocked_account_extensions = [{account_list}]\n"
+        ));
+        self
+    }
+
+    pub fn with_enabled_methods(mut self, methods: &[(&str, bool)]) -> Self {
+        let method_config = methods
+            .iter()
+            .map(|(name, enabled)| format!("{name} = {enabled}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        self.kora.enabled_methods = Some(format!("[kora.enabled_methods]\n{method_config}\n"));
+        self
+    }
+
+    pub fn with_cache_config(
+        mut self,
+        url: Option<&str>,
+        enabled: bool,
+        default_ttl: u64,
+        account_ttl: u64,
+    ) -> Self {
+        let url_line = match url {
+            Some(u) => format!("url = \"{u}\"\n"),
+            None => String::new(),
+        };
+
+        self.kora.cache_config = Some(format!(
+            "[kora.cache]\n{url_line}enabled = {enabled}\ndefault_ttl = {default_ttl}\naccount_ttl = {account_ttl}\n"
+        ));
+        self
+    }
+
+    pub fn with_usage_limit_config(
+        mut self,
+        enabled: bool,
+        cache_url: Option<&str>,
+        fallback_if_unavailable: bool,
+    ) -> Self {
+        let cache_url_line = match cache_url {
+            Some(url) => format!("cache_url = \"{url}\"\n"),
+            None => String::new(),
+        };
+
+        self.kora.usage_limit_config = Some(format!(
+            "[kora.usage_limit]\nenabled = {enabled}\n{cache_url_line}fallback_if_unavailable = {fallback_if_unavailable}\n"
+        ));
+        self
+    }
+
+    /// Add usage limit rules
+    /// Rules format: Vec<(program, instruction, max, window_seconds)>
+    /// - program/instruction: None for transaction-level, Some for instruction-level
+    /// - window_seconds: None = lifetime, Some(n) = time-windowed
+    pub fn with_usage_limit_rules(mut self, rules: Vec<UsageLimitRuleTuple<'static>>) -> Self {
+        let rules_toml = rules
+            .iter()
+            .map(|(program, instruction, max, window_seconds)| {
+                match (program, instruction) {
+                    (None, None) => {
+                        let window_part = window_seconds
+                            .map(|w| format!(", window_seconds = {w}"))
+                            .unwrap_or_default();
+                        format!("{{ type = \"transaction\", max = {max}{window_part} }}")
+                    }
+                    (Some(p), Some(i)) => {
+                        let window_part = window_seconds
+                            .map(|w| format!(", window_seconds = {w}"))
+                            .unwrap_or_default();
+                        format!(
+                            "{{ type = \"instruction\", program = \"{p}\", instruction = \"{i}\", max = {max}{window_part} }}"
+                        )
+                    }
+                    _ => panic!("Invalid rule: program and instruction must both be Some or both be None"),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        if let Some(ref mut config) = self.kora.usage_limit_config {
+            config.push_str(&format!("rules = [{rules_toml}]\n"));
+        } else {
+            self.kora.usage_limit_config = Some(format!(
+                "[kora.usage_limit]\nenabled = true\nfallback_if_unavailable = true\nrules = [{rules_toml}]\n"
+            ));
+        }
+        self
+    }
+
+    pub fn with_max_request_body_size(mut self, size: usize) -> Self {
+        self.kora.max_request_body_size = Some(size);
+        self
+    }
+
+    pub fn with_signing_config(mut self, timeout: u64, retries: u32) -> Self {
+        self.kora.sign_timeout_seconds = Some(timeout);
+        self.kora.sign_max_retries = Some(retries);
+        self
+    }
+
+    pub fn with_custom_section(mut self, section: &str) -> Self {
+        self.custom_sections.push(section.to_string());
+        self
+    }
+
+    pub fn build_toml(&self) -> String {
+        let programs_list = self
+            .validation
+            .allowed_programs
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let tokens_list = self
+            .validation
+            .allowed_tokens
+            .iter()
+            .map(|t| format!("\"{t}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let spl_tokens_config = match self.validation.allowed_spl_paid_tokens {
+            SplTokenConfig::Allowlist(ref tokens) => format!(
+                "[{}]",
+                tokens.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ")
+            ),
+            SplTokenConfig::All => format!("\"{}\"", "All"),
+        };
+
+        let disallowed_list = if self.validation.disallowed_accounts.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "[{}]",
+                self.validation
+                    .disallowed_accounts
+                    .iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
+        let require_one_of_list = if self.validation.require_one_of_programs.is_empty() {
+            "[]".to_string()
+        } else {
+            format!(
+                "[{}]",
+                self.validation
+                    .require_one_of_programs
+                    .iter()
+                    .map(|p| format!("\"{p}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+
+        let mut toml = format!(
+            "[validation]\n\
+            max_allowed_lamports = {}\n\
+            max_signatures = {}\n\
+            allowed_programs = [{}]\n\
+            require_one_of_programs = {}\n\
+            allowed_tokens = [{}]\n\
+            allowed_spl_paid_tokens = {}\n\
+            disallowed_accounts = {}\n\
+            price_source = \"{}\"\n\n",
+            self.validation.max_allowed_lamports,
+            self.validation.max_signatures,
+            programs_list,
+            require_one_of_list,
+            tokens_list,
+            spl_tokens_config,
+            disallowed_list,
+            self.validation.price_source
+        );
+
+        if let Some(ref price_config) = self.validation.price_config {
+            toml.push_str(&format!("{price_config}\n"));
+        }
+
+        if let Some(ref token_config) = self.validation.token_2022_config {
+            toml.push_str(&format!("{token_config}\n"));
+        }
+
+        toml.push_str(&format!("[kora]\nrate_limit = {}\n", self.kora.rate_limit));
+
+        if let Some(size) = self.kora.max_request_body_size {
+            toml.push_str(&format!("max_request_body_size = {size}\n"));
+        }
+
+        if let Some(timeout) = self.kora.sign_timeout_seconds {
+            toml.push_str(&format!("sign_timeout_seconds = {timeout}\n"));
+        }
+
+        if let Some(retries) = self.kora.sign_max_retries {
+            toml.push_str(&format!("sign_max_retries = {retries}\n"));
+        }
+
+        if let Some(ref methods_config) = self.kora.enabled_methods {
+            toml.push_str(&format!("{methods_config}\n"));
+        }
+
+        if let Some(ref cache_config) = self.kora.cache_config {
+            toml.push_str(&format!("{cache_config}\n"));
+        }
+
+        if let Some(ref usage_limit_config) = self.kora.usage_limit_config {
+            toml.push_str(&format!("{usage_limit_config}\n"));
+        }
+
+        for custom in &self.custom_sections {
+            toml.push_str(&format!("{custom}\n"));
+        }
+
+        toml
+    }
+
+    pub fn build_config(&self) -> Result<Config, KoraError> {
+        let toml_content = self.build_toml();
+        let temp_file = NamedTempFile::new().unwrap();
+        fs::write(&temp_file, toml_content).unwrap();
+        Config::load_config(temp_file.path())
+    }
+}
+
+/// Create an invalid config for testing error handling
+/// Used specifically for testing TOML parsing error scenarios
+pub fn create_invalid_config(content: &str) -> Result<Config, KoraError> {
+    let temp_file = NamedTempFile::new().unwrap();
+    fs::write(&temp_file, content).unwrap();
+    Config::load_config(temp_file.path())
+}

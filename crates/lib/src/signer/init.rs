@@ -1,89 +1,90 @@
 use crate::{
-    args::CommonArgs,
     error::KoraError,
-    signer::{KoraSigner, SolanaMemorySigner, VaultSigner},
+    rpc_server::RpcArgs,
+    signer::{SignerPool, SignerPoolConfig},
+    state::init_signer_pool,
 };
-use tk_rs::TurnkeySigner;
 
-pub fn init_signer_type(args: &CommonArgs) -> Result<KoraSigner, KoraError> {
-    if args.turnkey_signer {
-        init_turnkey_signer(args)
-    } else if args.vault_signer {
-        init_vault_signer(args)
-    } else {
-        init_memory_signer(args.private_key.as_ref())
+/// Initialize signer(s) based on RPC args - supports multi-signer mode or skip signers
+pub async fn init_signers(args: &RpcArgs) -> Result<(), KoraError> {
+    if args.skip_signer {
+        log::info!("Skipping signer initialization as requested");
+        return Ok(());
     }
+
+    if let Some(config_path) = &args.signers_config {
+        log::info!("Initializing multi-signer mode from config: {}", config_path.display());
+
+        let config = SignerPoolConfig::load_config(config_path)?;
+        let pool = SignerPool::from_config(config).await?;
+
+        init_signer_pool(pool)?;
+        log::info!("Multi-signer pool initialized successfully");
+    } else {
+        return Err(KoraError::ValidationError(
+            "Signers configuration is required unless using --no-load-signer".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
-fn init_vault_signer(config: &CommonArgs) -> Result<KoraSigner, KoraError> {
-    let vault_addr = config
-        .vault_addr
-        .as_ref()
-        .ok_or_else(|| KoraError::SigningError("Vault address required".to_string()))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        log::LoggingFormat,
+        rpc_server::args::{AuthArgs, RpcArgs},
+        tests::config_mock::ConfigMockBuilder,
+    };
+    use std::path::PathBuf;
 
-    let vault_token = config
-        .vault_token
-        .as_ref()
-        .ok_or_else(|| KoraError::SigningError("Vault token required".to_string()))?;
+    #[tokio::test]
+    async fn test_init_signers_skip_signer() {
+        let _m = ConfigMockBuilder::new().build_and_setup();
 
-    let key_name = config
-        .vault_key_name
-        .as_ref()
-        .ok_or_else(|| KoraError::SigningError("Vault key name required".to_string()))?;
+        let args = RpcArgs {
+            port: 8080,
+            logging_format: LoggingFormat::Standard,
+            signers_config: None,
+            skip_signer: true,
+            auth_args: AuthArgs { api_key: None, hmac_secret: None },
+        };
 
-    let pubkey = config
-        .vault_pubkey
-        .as_ref()
-        .ok_or_else(|| KoraError::SigningError("Vault public key required".to_string()))?;
+        let result = init_signers(&args).await;
+        assert!(result.is_ok());
+    }
 
-    let signer = VaultSigner::new(
-        vault_addr.to_string(),
-        vault_token.to_string(),
-        key_name.to_string(),
-        pubkey.to_string(),
-    )?;
+    #[tokio::test]
+    async fn test_init_signers_no_config_no_skip() {
+        let _m = ConfigMockBuilder::new().build_and_setup();
 
-    Ok(KoraSigner::Vault(signer))
-}
+        let args = RpcArgs {
+            port: 8080,
+            logging_format: LoggingFormat::Standard,
+            signers_config: None,
+            skip_signer: false,
+            auth_args: AuthArgs { api_key: None, hmac_secret: None },
+        };
 
-fn init_turnkey_signer(config: &CommonArgs) -> Result<KoraSigner, KoraError> {
-    let api_pub = config
-        .turnkey_api_public_key
-        .as_ref()
-        .ok_or_else(|| KoraError::SigningError("Turnkey API public key required".to_string()))?;
-    let api_priv = config
-        .turnkey_api_private_key
-        .as_ref()
-        .ok_or_else(|| KoraError::SigningError("Turnkey API private key required".to_string()))?;
-    let api_priv_key_id = config
-        .turnkey_private_key_id
-        .as_ref()
-        .ok_or_else(|| KoraError::SigningError("Turnkey private key ID required".to_string()))?;
-    let org_id = config
-        .turnkey_organization_id
-        .as_ref()
-        .ok_or_else(|| KoraError::SigningError("Turnkey organization ID required".to_string()))?;
-    let public_key_id = config
-        .turnkey_public_key
-        .as_ref()
-        .ok_or_else(|| KoraError::SigningError("Turnkey public key required".to_string()))?;
+        let result = init_signers(&args).await;
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), KoraError::ValidationError(_)));
+    }
 
-    let signer = TurnkeySigner::new(
-        api_pub.to_string(),
-        api_priv.to_string(),
-        org_id.to_string(),
-        api_priv_key_id.to_string(),
-        public_key_id.to_string(),
-    )?;
+    #[tokio::test]
+    async fn test_init_signers_with_invalid_config_path() {
+        let _m = ConfigMockBuilder::new().build_and_setup();
 
-    Ok(KoraSigner::Turnkey(signer))
-}
+        let args = RpcArgs {
+            port: 8080,
+            logging_format: LoggingFormat::Standard,
+            signers_config: Some(PathBuf::from("/nonexistent/config.toml")),
+            skip_signer: false,
+            auth_args: AuthArgs { api_key: None, hmac_secret: None },
+        };
 
-fn init_memory_signer(private_key: Option<&String>) -> Result<KoraSigner, KoraError> {
-    let key = private_key.ok_or_else(|| {
-        KoraError::SigningError("Private key required for memory signer".to_string())
-    })?;
-
-    let signer = SolanaMemorySigner::from_base58(key)?;
-    Ok(KoraSigner::Memory(signer))
+        let result = init_signers(&args).await;
+        assert!(result.is_err());
+    }
 }

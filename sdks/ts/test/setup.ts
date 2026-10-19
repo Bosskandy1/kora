@@ -1,0 +1,220 @@
+import {
+    Address,
+    assertIsAddress,
+    createClient,
+    createKeyPairSignerFromBytes,
+    getBase58Encoder,
+    KeyPairSigner,
+    lamports,
+} from '@solana/kit';
+import { solanaLocalRpc } from '@solana/kit-plugin-rpc';
+import { payer } from '@solana/kit-plugin-signer';
+import { tokenProgram, associatedTokenProgram } from '@solana-program/token';
+import { config } from 'dotenv';
+import path from 'path';
+
+import { KoraClient } from '../src/index.js';
+
+config({ path: path.resolve(process.cwd(), '.env') });
+
+// Each suite flavor (basic / auth / free) gets its own Kora node and its own
+// surfnet from the rust harness, which also seeds the wallets below.
+// DO NOT USE THESE KEYPAIRS IN PRODUCTION, TESTING KEYPAIRS ONLY
+const FLAVOR_WALLET_SECRETS = {
+    // 7kBPazc3KfccwopUa9dALgeBSXoYjdqtK5UEpXKCAYYH
+    auth: '5mDdF4AakwdsEMVKxQ566CNa4bxdqZCEfpWLz9HYWYt1ZjL48HAL8Q3p7ba4nJNUe8QpWrWh5n9kwLKegZm2J7vy',
+    // HhA5j2rRiPbMrpF2ZD36r69FyZf3zWmEHRNSZbbNdVjf
+    basic: 'tzgfgSWTE3KUA6qfRoFYLaSfJm59uUeZRDy4ybMrLn1JV2drA1mftiaEcVFvq1Lok6h6EX2C4Y9kSKLvQWyMpS5',
+    // HrQpAeuWRcajWzJ3FSe5UApiSX2Pp2nNdBDj7eZx4yCo
+    free: '4y8NiNNW9fLaaVVDAVxvUCobTXMTpKcZDSdwUidiYXVS8SPVTRg9hGbgUK4Tsp7vrQTK8kw4fJ1LUeHFFnthaFzB',
+} as const;
+
+const SUITE_FLAVOR =
+    process.env.ENABLE_AUTH === 'true' ? 'auth' : process.env.FREE_PRICING === 'true' ? 'free' : 'basic';
+
+const DEFAULTS = {
+    DECIMALS: 6,
+
+    // Make sure this matches the USDC mint in kora.toml (9BgeTKqmFsPVnfYscfM6NvsgmZxei7XfdciShQ6D3bxJ)
+    DESTINATION_ADDRESS: 'AVmDft8deQEo78bRKcGN5ZMf3hyjeLBK4Rd4xGB46yQM',
+
+    // DO NOT USE THESE KEYPAIRS IN PRODUCTION, TESTING KEYPAIRS ONLY
+    KORA_ADDRESS: '7AqpcUvgJ7Kh1VmJZ44rWp2XDow33vswo9VK9VqpPU2d',
+
+    KORA_RPC_URL: 'http://localhost:8080/',
+
+    SOLANA_RPC_URL: 'http://127.0.0.1:8899',
+
+    KORA_SIGNER_TYPE: 'memory',
+
+    SOL_DROP_AMOUNT: 1_000_000_000,
+
+    // 9BgeTKqmFsPVnfYscfM6NvsgmZxei7XfdciShQ6D3bxJ
+    TEST_USDC_MINT_SECRET: '59kKmXphL5UJANqpFFjtH17emEq3oRNmYsx6a3P3vSGJRmhMgVdzH77bkNEi9bArRViT45e8L2TsuPxKNFoc3Qfg',
+
+    TOKEN_DROP_AMOUNT: 100_000,
+};
+
+interface TestSuite {
+    destinationAddress: Address<string>;
+    koraAddress: Address<string>;
+    koraClient: KoraClient;
+    koraRpcUrl: string;
+    testWallet: KeyPairSigner<string>;
+    usdcMint: Address<string>;
+}
+
+const createKeyPairSignerFromB58Secret = async (b58Secret: string) => {
+    const base58Encoder = getBase58Encoder();
+    const b58SecretEncoded = base58Encoder.encode(b58Secret);
+    return await createKeyPairSignerFromBytes(b58SecretEncoded);
+};
+
+// TODO Add KORA_PRIVATE_KEY_2= support for multi-signer configs
+export function loadEnvironmentVariables() {
+    const koraSignerType = process.env.KORA_SIGNER_TYPE || DEFAULTS.KORA_SIGNER_TYPE;
+
+    let koraAddress = process.env.KORA_ADDRESS;
+    if (!koraAddress) {
+        switch (koraSignerType) {
+            case 'turnkey':
+                koraAddress = process.env.TURNKEY_PUBLIC_KEY;
+                if (!koraAddress) {
+                    throw new Error('TURNKEY_PUBLIC_KEY must be set when using Turnkey signer');
+                }
+                break;
+            case 'privy':
+                koraAddress = process.env.PRIVY_PUBLIC_KEY;
+                if (!koraAddress) {
+                    throw new Error('PRIVY_PUBLIC_KEY must be set when using Privy signer');
+                }
+                break;
+            case 'openfort':
+                koraAddress = process.env.OPENFORT_PUBLIC_KEY;
+                if (!koraAddress) {
+                    throw new Error('OPENFORT_PUBLIC_KEY must be set when using Openfort signer');
+                }
+                break;
+            case 'memory':
+            default:
+                koraAddress = DEFAULTS.KORA_ADDRESS;
+                break;
+        }
+    }
+
+    const koraRpcUrl = process.env.KORA_RPC_URL || DEFAULTS.KORA_RPC_URL;
+    const solanaRpcUrl = process.env.SOLANA_RPC_URL || DEFAULTS.SOLANA_RPC_URL;
+    const solanaWsUrl = process.env.SOLANA_WS_URL;
+    const tokenDecimals = Number(process.env.TOKEN_DECIMALS || DEFAULTS.DECIMALS);
+    const tokenDropAmount = Number(process.env.TOKEN_DROP_AMOUNT || DEFAULTS.TOKEN_DROP_AMOUNT);
+    const solDropAmount = BigInt(process.env.SOL_DROP_AMOUNT || DEFAULTS.SOL_DROP_AMOUNT);
+    const testWalletSecret = process.env.SENDER_SECRET || FLAVOR_WALLET_SECRETS[SUITE_FLAVOR];
+    const testUsdcMintSecret = process.env.TEST_USDC_MINT_SECRET || DEFAULTS.TEST_USDC_MINT_SECRET;
+    const destinationAddress = process.env.DESTINATION_ADDRESS || DEFAULTS.DESTINATION_ADDRESS;
+    assertIsAddress(destinationAddress);
+    assertIsAddress(koraAddress);
+
+    return {
+        destinationAddress,
+        koraAddress,
+        koraRpcUrl,
+        koraSignerType,
+        solanaRpcUrl,
+        solanaWsUrl,
+        solDropAmount,
+        testUsdcMintSecret,
+        testWalletSecret,
+        tokenDecimals,
+        tokenDropAmount,
+    };
+}
+
+async function createKeyPairSigners() {
+    const { testWalletSecret, testUsdcMintSecret, destinationAddress } = loadEnvironmentVariables();
+    const testWallet = await createKeyPairSignerFromB58Secret(testWalletSecret);
+    const usdcMint = await createKeyPairSignerFromB58Secret(testUsdcMintSecret);
+    return {
+        destinationAddress,
+        testWallet,
+        usdcMint,
+    };
+}
+
+// The rust harness seeds the mint before Kora starts, so its presence means
+// every account this suite needs is already on chain.
+async function isSeeded(
+    client: { rpc: { getAccountInfo: (address: Address) => { send: () => Promise<{ value: unknown }> } } },
+    mint: Address,
+) {
+    const { value } = await client.rpc.getAccountInfo(mint).send();
+    return value !== null;
+}
+
+async function setupTestSuite(): Promise<TestSuite> {
+    const { koraAddress, koraRpcUrl, solanaRpcUrl, solanaWsUrl, tokenDecimals, tokenDropAmount, solDropAmount } =
+        loadEnvironmentVariables();
+
+    const authConfig =
+        process.env.ENABLE_AUTH === 'true'
+            ? {
+                  apiKey: process.env.KORA_API_KEY || 'test-api-key-123',
+                  hmacSecret: process.env.KORA_HMAC_SECRET || 'test-hmac-secret-456',
+              }
+            : undefined;
+
+    const { testWallet, usdcMint, destinationAddress } = await createKeyPairSigners();
+    const client = await createClient()
+        .use(payer(testWallet))
+        .use(
+            solanaLocalRpc({
+                rpcUrl: solanaRpcUrl,
+                ...(solanaWsUrl ? { rpcSubscriptionsUrl: solanaWsUrl } : {}),
+            }),
+        )
+        .use(tokenProgram())
+        .use(associatedTokenProgram());
+
+    if (!(await isSeeded(client, usdcMint.address))) {
+        await client.airdrop(koraAddress, lamports(solDropAmount));
+        await client.airdrop(testWallet.address, lamports(solDropAmount));
+
+        await client.token.instructions
+            .createMint({
+                newMint: usdcMint,
+                decimals: tokenDecimals,
+                mintAuthority: testWallet.address,
+            })
+            .sendTransaction();
+
+        // mintToATA auto-creates the ATA
+        await client.token.instructions
+            .mintToATA({
+                mint: usdcMint.address,
+                owner: testWallet.address,
+                mintAuthority: testWallet,
+                amount: BigInt(tokenDropAmount * 10 ** tokenDecimals),
+                decimals: tokenDecimals,
+            })
+            .sendTransaction();
+
+        for (const owner of [koraAddress, destinationAddress]) {
+            await client.associatedToken.instructions
+                .createAssociatedTokenIdempotent({
+                    owner,
+                    mint: usdcMint.address,
+                })
+                .sendTransaction();
+        }
+    }
+
+    return {
+        destinationAddress,
+        koraAddress,
+        koraClient: new KoraClient({ rpcUrl: koraRpcUrl, ...authConfig }),
+        koraRpcUrl,
+        testWallet,
+        usdcMint: usdcMint.address,
+    };
+}
+
+export default setupTestSuite;

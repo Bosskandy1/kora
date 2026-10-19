@@ -4,5 +4,35 @@
 .idea/
 .vscode/
 *.pdb
-Cargo.lock
 generated/
+
+/tests/src/common/transfer-hook-example/target
+/examples/devnet-deploy-paymaster/registry-program/target
+/examples/devnet-deploy-paymaster/registry-program/*.so
+/examples/devnet-deploy-paymaster/registry-program/*keypair*.json
+
+# SDK
+node_modules/
+dist/
+.pnpm-store/
+
+# Coverage reports
+coverage/
+*.profraw
+
+# Proptest seeds: a checked-in seed for a real drain failure would publish the
+# failing case before a fix ships
+*.proptest-regressions
+
+.DS_Store
+
+# Make test files
+*.pid
+.local/
+
+# kora-deploy state file — contains raw keypair bytes
+.kora-deploy-state.json
+
+# AI (ignore all except skills/)
+.claude/*
+!.claude/skills/

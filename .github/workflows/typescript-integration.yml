@@ -1,0 +1,42 @@
+name: TypeScript Integration Tests
+
+# Called by integration.yml for routine CI and by typescript-publish.yml as a
+# release gate. Both own the build, so this workflow takes the artifact rather
+# than producing a second identical one.
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: "Artifact holding the prebuilt Kora binary"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_LOG: info
+  CI: true
+
+jobs:
+  typescript-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        test-target: [typescript_basic, typescript_auth, typescript_free]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./.github/actions/integration-phase
+        with:
+          test-target: ${{ matrix.test-target }}
+          artifact-name: ${{ inputs.artifact-name }}
+          setup-node: "true"
+
+      - name: Cleanup test environment
+        if: always()
+        uses: ./.github/actions/cleanup-test-env

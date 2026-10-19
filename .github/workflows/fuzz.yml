@@ -1,0 +1,108 @@
+name: Fuzz
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "fuzz/**"
+      - "Cargo.*"
+      - "rust-toolchain.toml"
+      - ".github/workflows/fuzz.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "fuzz/**"
+      - "Cargo.*"
+      - "rust-toolchain.toml"
+      - ".github/workflows/fuzz.yml"
+  schedule:
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  smoke:
+    name: Fuzz smoke (60s)
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-07-13
+          targets: x86_64-unknown-linux-gnu
+      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+          shared-key: "fuzz"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Build fuzz targets
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
+      - name: Smoke each target
+        run: |
+          for target in parse_transaction decode_b64_transaction validate_transaction differential_litesvm; do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" --target x86_64-unknown-linux-gnu -- -max_total_time=60
+            echo "::endgroup::"
+          done
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-crash-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  deep:
+    name: Fuzz deep run (10m)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [parse_transaction, decode_b64_transaction, validate_transaction, differential_litesvm]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: nightly-2026-07-13
+          targets: x86_64-unknown-linux-gnu
+      - uses: taiki-e/install-action@b8cecb83565409bcc297b2df6e77f030b2a468d5 # v2.82.0
+        with:
+          tool: cargo-fuzz
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz
+          shared-key: "fuzz"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Fuzz ${{ matrix.target }}
+        run: cargo fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu -- -max_total_time=600
+      - name: Upload corpus and crashes
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: |
+            fuzz/corpus/${{ matrix.target }}/
+            fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore

@@ -1,16 +1,29 @@
 use async_trait::async_trait;
-use mockall::automock;
 use solana_sdk::{instruction::Instruction, pubkey::Pubkey};
+use std::any::Any;
 
-pub trait TokenState {
+pub trait TokenState: Any + Send + Sync {
     fn mint(&self) -> Pubkey;
     fn owner(&self) -> Pubkey;
     fn amount(&self) -> u64;
     fn decimals(&self) -> u8;
+
+    fn as_any(&self) -> &dyn Any;
+}
+
+pub trait TokenMint: Any + Send + Sync {
+    fn address(&self) -> Pubkey;
+    fn mint_authority(&self) -> Option<Pubkey>;
+    fn supply(&self) -> u64;
+    fn decimals(&self) -> u8;
+    fn freeze_authority(&self) -> Option<Pubkey>;
+    fn is_initialized(&self) -> bool;
+    fn get_token_program(&self) -> Box<dyn TokenInterface>;
+
+    fn as_any(&self) -> &dyn Any;
 }
 
 #[async_trait]
-#[automock]
 pub trait TokenInterface: Send + Sync {
     fn program_id(&self) -> Pubkey;
 
@@ -53,13 +66,9 @@ pub trait TokenInterface: Send + Sync {
         mint: &Pubkey,
     ) -> Instruction;
 
-    fn get_mint_decimals(
+    fn unpack_mint(
         &self,
+        mint: &Pubkey,
         mint_data: &[u8],
-    ) -> Result<u8, Box<dyn std::error::Error + Send + Sync>>;
-
-    fn decode_transfer_instruction(
-        &self,
-        data: &[u8],
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>>;
+    ) -> Result<Box<dyn TokenMint + Send + Sync>, Box<dyn std::error::Error + Send + Sync>>;
 }

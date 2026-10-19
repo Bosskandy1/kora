@@ -1,0 +1,14 @@
+name: 'Cleanup Test Environment'
+description: 'Kill a Kora node that outlived its test binary'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Kill remaining processes
+      shell: bash
+      if: always()
+      run: |
+        echo "🧹 Safety cleanup of any remaining processes..."
+        pkill -f "kora" 2>/dev/null || true
+        sleep 1
+        echo "✅ Cleanup completed"

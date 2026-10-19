@@ -1,28 +1,229 @@
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicPtr, Ordering},
+    Arc,
+};
+use tokio_util::task::TaskTracker;
 
-use crate::{error::KoraError, signer::KoraSigner};
+use crate::{
+    config::Config, error::KoraError, signer::SignerPool, transaction::signing_retry_window,
+};
+use std::time::Duration;
 
-static GLOBAL_SIGNER: Lazy<Arc<RwLock<Option<KoraSigner>>>> =
-    Lazy::new(|| Arc::new(RwLock::new(None)));
+static GLOBAL_SIGNER_POOL: Lazy<RwLock<Option<Arc<SignerPool>>>> = Lazy::new(|| RwLock::new(None));
 
-/// Initialize the global signer with a KoraSigner instance
-pub fn init_signer(signer: KoraSigner) -> Result<(), KoraError> {
-    let mut signer_guard = GLOBAL_SIGNER.write();
-    if signer_guard.is_some() {
-        return Err(KoraError::InternalServerError("Signer already initialized".to_string()));
+static GLOBAL_CONFIG: AtomicPtr<Config> = AtomicPtr::new(std::ptr::null_mut());
+
+// Tracks detached background tasks (currently the fire-and-forget broadcasts of
+// `RespondAfter::Signed`) so a graceful shutdown can wait for in-flight sends
+// to reach an RPC node instead of cancelling them when the runtime exits.
+static BACKGROUND_TASKS: Lazy<TaskTracker> = Lazy::new(TaskTracker::new);
+
+/// Returns the global tracker for detached background tasks.
+///
+/// Spawn fire-and-forget work through this tracker (`get_background_tasks().spawn(..)`)
+/// so shutdown can drain it via [`drain_background_tasks`].
+pub fn get_background_tasks() -> &'static TaskTracker {
+    &BACKGROUND_TASKS
+}
+
+/// Waits for all tracked background tasks to finish, up to `timeout`.
+///
+/// Closes the tracker so no new spawns keep the wait alive, then awaits
+/// completion. Returns `false` if the timeout elapsed with tasks still running.
+pub async fn drain_background_tasks(timeout: Duration) -> bool {
+    drain_tracker(get_background_tasks(), timeout).await
+}
+
+async fn drain_tracker(tracker: &TaskTracker, timeout: Duration) -> bool {
+    tracker.close();
+
+    if tracker.is_empty() {
+        return true;
     }
 
-    *signer_guard = Some(signer);
+    tokio::time::timeout(timeout, tracker.wait()).await.is_ok()
+}
+
+fn sync_probe_lease_from_config(pool: &SignerPool, config: &Config) {
+    let sign_timeout = Duration::from_secs(config.kora.sign_timeout_seconds);
+    pool.set_probe_lease(signing_retry_window(sign_timeout, config.kora.sign_max_retries));
+}
+
+/// Select a request-scoped signer without mutating recovery probe state.
+pub fn select_request_signer_with_signer_key(
+    signer_key: Option<&str>,
+) -> Result<Arc<solana_keychain::Signer>, KoraError> {
+    let config = get_config()?;
+    let pool = get_signer_pool()?;
+    sync_probe_lease_from_config(&pool, config);
+
+    if let Some(signer_key) = signer_key {
+        return pool.select_signer_by_pubkey(signer_key);
+    }
+
+    pool.select_next_signer()
+        .map_err(|e| KoraError::InternalServerError(format!("Failed to get signer from pool: {e}")))
+}
+
+/// Reserve a request-scoped signer, acquiring a recovery probe lock if needed.
+pub fn get_request_signer_with_signer_key(
+    signer_key: Option<&str>,
+) -> Result<Arc<solana_keychain::Signer>, KoraError> {
+    let config = get_config()?;
+    let pool = get_signer_pool()?;
+    sync_probe_lease_from_config(&pool, config);
+
+    if let Some(signer_key) = signer_key {
+        return pool.get_signer_by_pubkey(signer_key);
+    }
+
+    pool.get_next_signer()
+        .map_err(|e| KoraError::InternalServerError(format!("Failed to get signer from pool: {e}")))
+}
+
+pub fn reserve_request_signer_by_pubkey(
+    signer_pubkey: &solana_sdk::pubkey::Pubkey,
+) -> Result<Arc<solana_keychain::Signer>, KoraError> {
+    get_request_signer_with_signer_key(Some(&signer_pubkey.to_string()))
+}
+
+pub fn init_signer_pool(pool: SignerPool) -> Result<(), KoraError> {
+    let mut pool_guard = GLOBAL_SIGNER_POOL.write();
+    if pool_guard.is_some() {
+        return Err(KoraError::InternalServerError("Signer pool already initialized".to_string()));
+    }
+
+    log::info!(
+        "Initializing global signer pool with {} signers using {:?} strategy",
+        pool.len(),
+        pool.strategy()
+    );
+
+    *pool_guard = Some(Arc::new(pool));
     Ok(())
 }
 
-/// Get a reference to the global signer
-pub fn get_signer() -> Result<Arc<KoraSigner>, KoraError> {
-    let signer_guard = GLOBAL_SIGNER.read();
-    match &*signer_guard {
-        Some(signer) => Ok(Arc::new(signer.clone())),
-        None => Err(KoraError::InternalServerError("Signer not initialized".to_string())),
+pub fn get_signer_pool() -> Result<Arc<SignerPool>, KoraError> {
+    let pool_guard = GLOBAL_SIGNER_POOL.read();
+    match &*pool_guard {
+        Some(pool) => Ok(Arc::clone(pool)),
+        None => Err(KoraError::InternalServerError("Signer pool not initialized".to_string())),
+    }
+}
+
+pub fn get_signers_info() -> Result<Vec<crate::signer::SignerInfo>, KoraError> {
+    let pool = get_signer_pool()?;
+    Ok(pool.get_signers_info())
+}
+
+#[cfg(test)]
+pub fn update_signer_pool(new_pool: SignerPool) -> Result<(), KoraError> {
+    let mut pool_guard = GLOBAL_SIGNER_POOL.write();
+
+    *pool_guard = Some(Arc::new(new_pool));
+
+    Ok(())
+}
+
+pub fn init_config(config: Config) -> Result<(), KoraError> {
+    let current_ptr = GLOBAL_CONFIG.load(Ordering::Acquire);
+    if !current_ptr.is_null() {
+        return Err(KoraError::InternalServerError("Config already initialized".to_string()));
+    }
+
+    let config_ptr = Box::into_raw(Box::new(config));
+    GLOBAL_CONFIG.store(config_ptr, Ordering::Release);
+    Ok(())
+}
+
+pub fn get_config() -> Result<&'static Config, KoraError> {
+    let config_ptr = GLOBAL_CONFIG.load(Ordering::Acquire);
+    if config_ptr.is_null() {
+        return Err(KoraError::InternalServerError("Config not initialized".to_string()));
+    }
+
+    // SAFETY: We ensure the pointer is valid and the config lives for the duration of the program
+    Ok(unsafe { &*config_ptr })
+}
+
+#[cfg(test)]
+pub fn update_config(new_config: Config) -> Result<(), KoraError> {
+    let old_ptr = GLOBAL_CONFIG.load(Ordering::Acquire);
+    let new_ptr = Box::into_raw(Box::new(new_config));
+
+    GLOBAL_CONFIG.store(new_ptr, Ordering::Release);
+
+    if !old_ptr.is_null() {
+        unsafe {
+            let _ = Box::from_raw(old_ptr);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{signer::pool::SignerWithMetadata, tests::config_mock::ConfigMockBuilder};
+    use serial_test::serial;
+    use solana_keychain::Signer;
+    use solana_sdk::signature::Keypair;
+
+    #[test]
+    #[serial]
+    fn test_select_request_signer_updates_probe_lease_from_config() {
+        let mut config = ConfigMockBuilder::new().build();
+        config.kora.sign_timeout_seconds = 15;
+        config.kora.sign_max_retries = 5;
+        update_config(config).unwrap();
+
+        let keypair = Keypair::new();
+        let signer = Signer::from_memory(&keypair.to_base58_string()).unwrap();
+        let pool = SignerPool::new(vec![SignerWithMetadata::new(
+            "test_signer".to_string(),
+            Arc::new(signer),
+            1,
+        )]);
+        update_signer_pool(pool).unwrap();
+
+        let _ = select_request_signer_with_signer_key(None).unwrap();
+
+        let pool = get_signer_pool().unwrap();
+        assert_eq!(pool.probe_lease(), signing_retry_window(Duration::from_secs(15), 5));
+    }
+
+    #[tokio::test]
+    async fn test_drain_tracker_waits_for_in_flight_task() {
+        let tracker = TaskTracker::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tracker.spawn(async move {
+            let _ = rx.await;
+        });
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(());
+        });
+
+        assert!(drain_tracker(&tracker, Duration::from_secs(5)).await);
+    }
+
+    #[tokio::test]
+    async fn test_drain_tracker_times_out_when_task_outlives_timeout() {
+        let tracker = TaskTracker::new();
+        tracker.spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+
+        assert!(!drain_tracker(&tracker, Duration::from_millis(50)).await);
+    }
+
+    #[tokio::test]
+    async fn test_drain_tracker_returns_immediately_when_empty() {
+        let tracker = TaskTracker::new();
+        assert!(drain_tracker(&tracker, Duration::from_secs(5)).await);
     }
 }

@@ -1,0 +1,170 @@
+use crate::{
+    config::{EnabledMethods, ValidationConfig},
+    signer::SelectionStrategy,
+    state::{self, get_signer_pool},
+    KoraError,
+};
+use serde::Serialize;
+use utoipa::ToSchema;
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SignerPoolInfo {
+    pub strategy: SelectionStrategy,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct GetConfigResponse {
+    pub fee_payers: Vec<String>,
+    pub validation_config: ValidationConfig,
+    pub enabled_methods: EnabledMethods,
+}
+
+pub async fn get_config() -> Result<GetConfigResponse, KoraError> {
+    let config = state::get_config()?;
+
+    let pool = get_signer_pool()
+        .map_err(|e| KoraError::InternalServerError(format!("Signer pool not initialized: {e}")))?;
+
+    let fee_payers: Vec<String> =
+        pool.get_signers_info().iter().map(|signer| signer.public_key.clone()).collect();
+
+    Ok(GetConfigResponse {
+        fee_payers,
+        validation_config: config.validation.clone(),
+        enabled_methods: config.kora.enabled_methods.clone(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        config::ProgramsConfig,
+        tests::{common::setup_or_get_test_signer, config_mock::ConfigMockBuilder},
+    };
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn test_get_config_success() {
+        let config = ConfigMockBuilder::new().build();
+        state::update_config(config).expect("Failed to update config");
+
+        let _ = setup_or_get_test_signer();
+
+        let result = get_config().await;
+
+        let response = result.unwrap();
+
+        // Assert fee payers
+        assert!(!response.fee_payers.is_empty(), "Should have at least one fee payer");
+        assert!(!response.fee_payers[0].is_empty(), "Fee payer pubkey should not be empty");
+
+        // Assert ValidationConfig defaults
+        assert_eq!(response.validation_config.max_allowed_lamports, 1_000_000_000);
+        assert_eq!(response.validation_config.max_signatures, 10);
+        assert_eq!(response.validation_config.allowed_programs.as_slice().len(), 3);
+        assert_eq!(
+            response.validation_config.allowed_programs.as_slice()[0],
+            "11111111111111111111111111111111"
+        );
+        assert_eq!(
+            response.validation_config.allowed_programs.as_slice()[1],
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        );
+        assert_eq!(
+            response.validation_config.allowed_programs.as_slice()[2],
+            "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        );
+        assert_eq!(response.validation_config.allowed_tokens.len(), 1);
+        assert_eq!(
+            response.validation_config.allowed_tokens[0],
+            "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+        );
+        assert_eq!(response.validation_config.allowed_spl_paid_tokens.as_slice().len(), 1);
+        assert_eq!(
+            response.validation_config.allowed_spl_paid_tokens.as_slice()[0],
+            "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU"
+        );
+        assert_eq!(response.validation_config.disallowed_accounts.len(), 0);
+        assert_eq!(response.validation_config.price_source, crate::oracle::PriceSource::Mock);
+
+        assert!(!response.validation_config.fee_payer_policy.system.allow_transfer);
+        assert!(!response.validation_config.fee_payer_policy.system.allow_assign);
+        assert!(!response.validation_config.fee_payer_policy.system.allow_create_account);
+        assert!(!response.validation_config.fee_payer_policy.system.allow_allocate);
+        assert!(!response.validation_config.fee_payer_policy.system.nonce.allow_initialize);
+        assert!(!response.validation_config.fee_payer_policy.system.nonce.allow_advance);
+        assert!(!response.validation_config.fee_payer_policy.system.nonce.allow_withdraw);
+        assert!(!response.validation_config.fee_payer_policy.system.nonce.allow_authorize);
+
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_transfer);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_burn);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_close_account);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_approve);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_revoke);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_set_authority);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_mint_to);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_initialize_mint);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_initialize_account);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_initialize_multisig);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_freeze_account);
+        assert!(!response.validation_config.fee_payer_policy.spl_token.allow_thaw_account);
+
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_transfer);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_burn);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_close_account);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_approve);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_revoke);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_set_authority);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_mint_to);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_initialize_mint);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_initialize_account);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_initialize_multisig);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_freeze_account);
+        assert!(!response.validation_config.fee_payer_policy.token_2022.allow_thaw_account);
+
+        assert!(!response.validation_config.fee_payer_policy.alt.allow_create);
+        assert!(!response.validation_config.fee_payer_policy.alt.allow_extend);
+        assert!(!response.validation_config.fee_payer_policy.alt.allow_freeze);
+        assert!(!response.validation_config.fee_payer_policy.alt.allow_deactivate);
+        assert!(!response.validation_config.fee_payer_policy.alt.allow_close);
+        match response.validation_config.price.model {
+            crate::fee::price::PriceModel::Margin { margin } => assert_eq!(margin, 0.0),
+            _ => panic!("Expected Margin price model"),
+        }
+
+        assert_eq!(response.validation_config.token_2022.blocked_mint_extensions.len(), 0);
+        assert_eq!(response.validation_config.token_2022.blocked_account_extensions.len(), 0);
+
+        assert!(response.enabled_methods.liveness);
+        assert!(response.enabled_methods.estimate_transaction_fee);
+        assert!(response.enabled_methods.get_supported_tokens);
+        assert!(response.enabled_methods.get_payer_signer);
+        assert!(response.enabled_methods.sign_transaction);
+        assert!(response.enabled_methods.sign_and_send_transaction);
+        assert!(response.enabled_methods.transfer_transaction);
+        assert!(response.enabled_methods.get_blockhash);
+        assert!(response.enabled_methods.get_config);
+    }
+
+    #[test]
+    fn test_get_config_response_serializes_programs_config_all_as_string() {
+        // The TS SDK / OpenAPI contract relies on `allowed_programs` being either
+        // the string "All" or an array of strings on the wire. Guard against any
+        // future field annotation that would break this user-facing shape.
+        let mut validation_config = crate::tests::config_mock::ValidationConfigBuilder::new()
+            .with_allowed_programs(vec!["program1".to_string()])
+            .build();
+        validation_config.allowed_programs = ProgramsConfig::All;
+
+        let response = GetConfigResponse {
+            fee_payers: vec![],
+            validation_config,
+            enabled_methods: EnabledMethods::default(),
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["validation_config"]["allowed_programs"], serde_json::json!("All"));
+    }
+}

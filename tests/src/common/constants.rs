@@ -1,0 +1,82 @@
+/// Default recipient public key for tests
+pub const RECIPIENT_PUBKEY: &str = "AVmDft8deQEo78bRKcGN5ZMf3hyjeLBK4Rd4xGB46yQM";
+
+/// Test disallowed address for lookup table tests
+pub const TEST_DISALLOWED_ADDRESS: &str = "hndXZGK45hCxfBYvxejAXzCfCujoqkNf7rk4sTB8pek";
+
+/// Test payment address for paymaster tests
+pub const TEST_PAYMENT_ADDRESS: &str = "CWvWnVwqAb9HzqwCGkn4purGEUuu27aNsPQM252uLerV";
+
+/// Wallets for the TypeScript suite flavors that run concurrently (auth, free);
+/// the basic flavor reuses the rust sender. Secrets live in sdks/ts/test/setup.ts.
+pub const TS_AUTH_WALLET_PUBKEY: &str = "7kBPazc3KfccwopUa9dALgeBSXoYjdqtK5UEpXKCAYYH";
+pub const TS_FREE_WALLET_PUBKEY: &str = "HrQpAeuWRcajWzJ3FSe5UApiSX2Pp2nNdBDj7eZx4yCo";
+
+/// Transfer hook program ID
+pub const TRANSFER_HOOK_PROGRAM_ID: &str = "Bcdikjss8HWzKEuj6gEQoFq9TCnGnk6v3kUnRU1gb6hA";
+
+/// Transfer hook program binary path (relative to workspace root)
+pub const TRANSFER_HOOK_PROGRAM_PATH: &str =
+    "tests/src/common/transfer-hook-example/transfer_hook_example.so";
+
+/// Lighthouse program ID
+pub const LIGHTHOUSE_PROGRAM_ID: &str = "L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95";
+
+/// Lighthouse program binary path (relative to workspace root)
+pub const LIGHTHOUSE_PROGRAM_PATH: &str = "tests/src/common/fixtures/test-programs/lighthouse.so";
+
+/// `disable_sbpf_v0_v1_v2_deployment` feature gate
+pub const DISABLE_SBPF_V0_V1_V2_DEPLOYMENT_FEATURE: &str =
+    "B8JJXCy5amZyWG9r7EnUYLwzXSXTxG7GZ1qZ1qggo83g";
+
+/// Test USDC mint decimals
+pub const TEST_USDC_MINT_DECIMALS: u8 = 6;
+
+/// Test API key for authentication tests
+pub const TEST_API_KEY: &str = "test-api-key-123";
+
+/// Test HMAC secret for authentication tests
+pub const TEST_HMAC_SECRET: &str = "test-hmac-secret-456";
+
+/// RPC URL environment variable
+pub const RPC_URL_ENV: &str = "RPC_URL";
+
+/// KORA private key environment variable
+pub const KORA_PRIVATE_KEY_ENV: &str = "KORA_PRIVATE_KEY";
+
+/// Signer 2 private key environment variable
+pub const SIGNER_2_KEYPAIR_ENV: &str = "SIGNER_2_KEYPAIR";
+
+/// Test sender private key environment variable
+pub const TEST_SENDER_KEYPAIR_ENV: &str = "TEST_SENDER_KEYPAIR";
+
+/// Test USDC mint private key environment variable
+pub const TEST_USDC_MINT_KEYPAIR_ENV: &str = "TEST_USDC_MINT_KEYPAIR";
+
+/// Test USDC mint 2022 private key environment variable
+pub const TEST_USDC_MINT_2022_KEYPAIR_ENV: &str = "TEST_USDC_MINT_2022_KEYPAIR";
+
+/// Test interest bearing mint private key environment variable
+pub const TEST_INTEREST_BEARING_MINT_KEYPAIR_ENV: &str = "TEST_INTEREST_BEARING_MINT_KEYPAIR";
+
+/// Test transfer hook mint private key environment variable
+pub const TEST_TRANSFER_HOOK_MINT_KEYPAIR_ENV: &str = "TEST_TRANSFER_HOOK_MINT_KEYPAIR";
+
+/// Fee payer policy mint private key environment variable
+pub const TEST_FEE_PAYER_POLICY_MINT_KEYPAIR_ENV: &str = "TEST_FEE_PAYER_POLICY_MINT_KEYPAIR";
+
+/// Fee payer policy mint 2022 private key environment variable
+pub const TEST_FEE_PAYER_POLICY_MINT_2022_KEYPAIR_ENV: &str =
+    "TEST_FEE_PAYER_POLICY_MINT_2022_KEYPAIR";
+
+/// Payment address keypair environment variable
+pub const PAYMENT_ADDRESS_KEYPAIR_ENV: &str = "PAYMENT_ADDRESS_KEYPAIR";
+
+/// Test allowed lookup table address environment variable
+pub const TEST_ALLOWED_LOOKUP_TABLE_ADDRESS_ENV: &str = "TEST_ALLOWED_LOOKUP_TABLE_ADDRESS";
+
+/// Test disallowed lookup table address environment variable
+pub const TEST_DISALLOWED_LOOKUP_TABLE_ADDRESS_ENV: &str = "TEST_DISALLOWED_LOOKUP_TABLE_ADDRESS";
+
+/// Test transaction lookup table address environment variable
+pub const TEST_TRANSACTION_LOOKUP_TABLE_ADDRESS_ENV: &str = "TEST_TRANSACTION_LOOKUP_TABLE_ADDRESS";

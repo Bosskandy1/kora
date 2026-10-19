@@ -1,0 +1,1015 @@
+use crate::{error::KoraError, sanitize_error, signer::utils::get_env_var_for_signer};
+use serde::{Deserialize, Serialize};
+use solana_keychain::{OpenfortSigner as KeychainOpenfortSigner, Signer};
+use std::{fmt, fs, path::Path};
+
+/// Configuration for a pool of signers
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SignerPoolConfig {
+    /// Signer pool configuration
+    pub signer_pool: SignerPoolSettings,
+    /// List of individual signer configurations
+    pub signers: Vec<SignerConfig>,
+}
+
+/// Settings for the signer pool behavior
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignerPoolSettings {
+    /// Selection strategy for choosing signers
+    #[serde(default = "default_strategy")]
+    pub strategy: SelectionStrategy,
+}
+
+/// Available signer selection strategies
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SelectionStrategy {
+    RoundRobin,
+    Random,
+    Weighted,
+}
+
+impl fmt::Display for SelectionStrategy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            SelectionStrategy::RoundRobin => "round_robin",
+            SelectionStrategy::Random => "random",
+            SelectionStrategy::Weighted => "weighted",
+        };
+        write!(f, "{s}")
+    }
+}
+
+fn default_strategy() -> SelectionStrategy {
+    SelectionStrategy::RoundRobin
+}
+
+/// Configuration for an individual signer
+#[derive(Clone, Serialize, Deserialize)]
+pub struct SignerConfig {
+    /// Human-readable name for this signer
+    pub name: String,
+    /// Weight for weighted selection strategy (optional, defaults to 1)
+    pub weight: Option<u32>,
+
+    /// Signer-specific configuration
+    #[serde(flatten)]
+    pub config: SignerTypeConfig,
+}
+
+/// Memory signer configuration (local keypair)
+#[derive(Clone, Serialize, Deserialize)]
+pub struct MemorySignerConfig {
+    pub private_key_env: String,
+}
+
+/// Configuration for remote signer HTTP request and connection settings
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RemoteSignerHttpConfig {
+    pub request_timeout_secs: Option<u64>,
+    pub connect_timeout_secs: Option<u64>,
+}
+
+impl From<&RemoteSignerHttpConfig> for solana_keychain::HttpClientConfig {
+    fn from(c: &RemoteSignerHttpConfig) -> Self {
+        solana_keychain::HttpClientConfig {
+            request_timeout: c.request_timeout_secs.map(std::time::Duration::from_secs),
+            connect_timeout: c.connect_timeout_secs.map(std::time::Duration::from_secs),
+        }
+    }
+}
+
+/// Turnkey signer configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TurnkeySignerConfig {
+    pub api_public_key_env: String,
+    pub api_private_key_env: String,
+    pub organization_id_env: String,
+    pub private_key_id_env: String,
+    pub public_key_env: String,
+    #[serde(default)]
+    pub http_config: Option<RemoteSignerHttpConfig>,
+}
+
+/// Privy signer configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct PrivySignerConfig {
+    pub app_id_env: String,
+    pub app_secret_env: String,
+    pub wallet_id_env: String,
+    #[serde(default)]
+    pub http_config: Option<RemoteSignerHttpConfig>,
+}
+
+/// Openfort backend wallet signer configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct OpenfortSignerConfig {
+    /// Env var holding the Openfort project secret key (`sk_test_*` / `sk_live_*`).
+    pub secret_key_env: String,
+    /// Env var holding the backend wallet account ID (`acc_<uuid>`).
+    pub account_id_env: String,
+    /// Env var holding the ECDSA P-256 wallet secret from the Openfort dashboard.
+    /// Accepts either a base64-encoded PKCS#8 DER body (single-line, env-var-friendly)
+    /// or a full PEM string (`-----BEGIN PRIVATE KEY-----` ...).
+    pub wallet_secret_env: String,
+    /// Optional override for the Openfort API base URL (defaults to `https://api.openfort.io`).
+    /// Useful for pointing at staging or mock endpoints during testing. Must use HTTPS.
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    #[serde(default)]
+    pub http_config: Option<RemoteSignerHttpConfig>,
+}
+
+/// Vault signer configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct VaultSignerConfig {
+    pub vault_addr_env: String,
+    pub vault_token_env: String,
+    pub key_name_env: String,
+    pub pubkey_env: String,
+    #[serde(default)]
+    pub http_config: Option<RemoteSignerHttpConfig>,
+}
+
+/// AWS KMS signer configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AwsKmsSignerConfig {
+    pub key_id_env: String,
+    pub public_key_env: String,
+    #[serde(default)]
+    pub region_env: Option<String>,
+}
+
+/// GCP KMS signer configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GcpKmsSignerConfig {
+    pub key_name_env: String,
+    pub public_key_env: String,
+}
+
+/// Para signer configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ParaSignerConfig {
+    pub api_key_env: String,
+    pub wallet_id_env: String,
+}
+
+/// CDP (Coinbase Developer Platform) signer configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CdpSignerConfig {
+    pub api_key_id_env: String,
+    pub api_key_secret_env: String,
+    pub wallet_secret_env: String,
+    pub address_env: String,
+    #[serde(default)]
+    pub http_config: Option<RemoteSignerHttpConfig>,
+}
+
+/// Dfns signer configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DfnsSignerConfig {
+    pub auth_token_env: String,
+    pub cred_id_env: String,
+    pub private_key_pem_env: String,
+    pub wallet_id_env: String,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    #[serde(default)]
+    pub http_config: Option<RemoteSignerHttpConfig>,
+}
+
+/// Fireblocks signer configuration
+#[derive(Clone, Serialize, Deserialize)]
+pub struct FireblocksSignerConfig {
+    pub api_key_env: String,
+    pub private_key_pem_env: String,
+    pub vault_account_id_env: String,
+    #[serde(default)]
+    pub asset_id: Option<String>,
+    #[serde(default)]
+    pub api_base_url: Option<String>,
+    #[serde(default)]
+    pub poll_interval_ms: Option<u64>,
+    #[serde(default)]
+    pub max_poll_attempts: Option<u32>,
+    #[serde(default)]
+    pub use_program_call: Option<bool>,
+    #[serde(default)]
+    pub http_config: Option<RemoteSignerHttpConfig>,
+}
+
+/// Signer type-specific configuration
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SignerTypeConfig {
+    /// Memory signer configuration
+    Memory {
+        #[serde(flatten)]
+        config: MemorySignerConfig,
+    },
+    /// Turnkey signer configuration
+    Turnkey {
+        #[serde(flatten)]
+        config: TurnkeySignerConfig,
+    },
+    /// Privy signer configuration
+    Privy {
+        #[serde(flatten)]
+        config: PrivySignerConfig,
+    },
+    /// Vault signer configuration
+    Vault {
+        #[serde(flatten)]
+        config: VaultSignerConfig,
+    },
+    /// AWS KMS signer configuration
+    AwsKms {
+        #[serde(flatten)]
+        config: AwsKmsSignerConfig,
+    },
+    /// Fireblocks signer configuration
+    Fireblocks {
+        #[serde(flatten)]
+        config: FireblocksSignerConfig,
+    },
+    /// GCP KMS signer configuration
+    GcpKms {
+        #[serde(flatten)]
+        config: GcpKmsSignerConfig,
+    },
+    /// Para signer configuration
+    Para {
+        #[serde(flatten)]
+        config: ParaSignerConfig,
+    },
+    /// CDP signer configuration
+    Cdp {
+        #[serde(flatten)]
+        config: CdpSignerConfig,
+    },
+    /// Dfns signer configuration
+    Dfns {
+        #[serde(flatten)]
+        config: DfnsSignerConfig,
+    },
+    /// Openfort backend wallet signer configuration
+    Openfort {
+        #[serde(flatten)]
+        config: OpenfortSignerConfig,
+    },
+}
+
+impl SignerPoolConfig {
+    /// Load signer pool configuration from TOML file
+    pub fn load_config<P: AsRef<Path>>(path: P) -> Result<Self, KoraError> {
+        let contents = fs::read_to_string(path).map_err(|e| {
+            KoraError::InternalServerError(format!(
+                "Failed to read signer config file: {}",
+                sanitize_error!(e)
+            ))
+        })?;
+
+        let config: SignerPoolConfig = toml::from_str(&contents).map_err(|e| {
+            KoraError::ValidationError(format!(
+                "Failed to parse signers config TOML: {}",
+                sanitize_error!(e)
+            ))
+        })?;
+
+        config.validate_signer_config()?;
+
+        Ok(config)
+    }
+
+    /// Validate the signer pool configuration
+    pub fn validate_signer_config(&self) -> Result<(), KoraError> {
+        self.validate_signer_not_empty()?;
+
+        for (index, signer) in self.signers.iter().enumerate() {
+            signer.validate_individual_signer_config(index)?;
+        }
+
+        self.validate_signer_names()?;
+        self.validate_strategy_weights()?;
+
+        Ok(())
+    }
+
+    pub fn validate_signer_not_empty(&self) -> Result<(), KoraError> {
+        if self.signers.is_empty() {
+            return Err(KoraError::ValidationError(
+                "At least one signer must be configured".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_signer_names(&self) -> Result<(), KoraError> {
+        let mut names = std::collections::HashSet::new();
+        for signer in &self.signers {
+            if !names.insert(&signer.name) {
+                return Err(KoraError::ValidationError(format!(
+                    "Duplicate signer name: {}",
+                    signer.name
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_strategy_weights(&self) -> Result<(), KoraError> {
+        if matches!(self.signer_pool.strategy, SelectionStrategy::Weighted) {
+            for signer in &self.signers {
+                if let Some(weight) = signer.weight {
+                    if weight == 0 {
+                        return Err(KoraError::ValidationError(format!(
+                            "Signer '{}' has weight of 0 in weighted strategy",
+                            signer.name
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl SignerConfig {
+    /// Build an external signer from configuration by resolving environment variables
+    pub async fn build_signer_from_config(config: &SignerConfig) -> Result<Signer, KoraError> {
+        match &config.config {
+            SignerTypeConfig::Memory { config: memory_config } => {
+                Self::build_memory_signer(memory_config, &config.name)
+            }
+            SignerTypeConfig::Turnkey { config: turnkey_config } => {
+                Self::build_turnkey_signer(turnkey_config, &config.name)
+            }
+            SignerTypeConfig::Privy { config: privy_config } => {
+                Self::build_privy_signer(privy_config, &config.name).await
+            }
+            SignerTypeConfig::Vault { config: vault_config } => {
+                Self::build_vault_signer(vault_config, &config.name)
+            }
+            SignerTypeConfig::AwsKms { config: aws_kms_config } => {
+                Self::build_aws_kms_signer(aws_kms_config, &config.name).await
+            }
+            SignerTypeConfig::Fireblocks { config: fireblocks_config } => {
+                Self::build_fireblocks_signer(fireblocks_config, &config.name).await
+            }
+            SignerTypeConfig::GcpKms { config: gcp_kms_config } => {
+                Self::build_gcp_kms_signer(gcp_kms_config, &config.name).await
+            }
+            SignerTypeConfig::Para { config: para_config } => {
+                Self::build_para_signer(para_config, &config.name).await
+            }
+            SignerTypeConfig::Cdp { config: cdp_config } => {
+                Self::build_cdp_signer(cdp_config, &config.name)
+            }
+            SignerTypeConfig::Dfns { config: dfns_config } => {
+                Self::build_dfns_signer(dfns_config, &config.name).await
+            }
+            SignerTypeConfig::Openfort { config: openfort_config } => {
+                Self::build_openfort_signer(openfort_config, &config.name).await
+            }
+        }
+    }
+
+    fn build_memory_signer(
+        config: &MemorySignerConfig,
+        signer_name: &str,
+    ) -> Result<Signer, KoraError> {
+        let private_key = get_env_var_for_signer(&config.private_key_env, signer_name)?;
+        Signer::from_memory(&private_key).map_err(|e| {
+            KoraError::SigningError(format!(
+                "Failed to create memory signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        })
+    }
+
+    fn build_turnkey_signer(
+        config: &TurnkeySignerConfig,
+        signer_name: &str,
+    ) -> Result<Signer, KoraError> {
+        let api_public_key = get_env_var_for_signer(&config.api_public_key_env, signer_name)?;
+        let api_private_key = get_env_var_for_signer(&config.api_private_key_env, signer_name)?;
+        let organization_id = get_env_var_for_signer(&config.organization_id_env, signer_name)?;
+        let private_key_id = get_env_var_for_signer(&config.private_key_id_env, signer_name)?;
+        let public_key = get_env_var_for_signer(&config.public_key_env, signer_name)?;
+
+        Signer::from_turnkey(
+            api_public_key,
+            api_private_key,
+            organization_id,
+            private_key_id,
+            public_key,
+            config.http_config.as_ref().map(solana_keychain::HttpClientConfig::from),
+        )
+        .map_err(|e| {
+            KoraError::SigningError(format!(
+                "Failed to create Turnkey signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        })
+    }
+
+    async fn build_privy_signer(
+        config: &PrivySignerConfig,
+        signer_name: &str,
+    ) -> Result<Signer, KoraError> {
+        let app_id = get_env_var_for_signer(&config.app_id_env, signer_name)?;
+        let app_secret = get_env_var_for_signer(&config.app_secret_env, signer_name)?;
+        let wallet_id = get_env_var_for_signer(&config.wallet_id_env, signer_name)?;
+
+        Signer::from_privy(
+            app_id,
+            app_secret,
+            wallet_id,
+            config.http_config.as_ref().map(solana_keychain::HttpClientConfig::from),
+        )
+        .await
+        .map_err(|e| {
+            KoraError::SigningError(format!(
+                "Failed to create Privy signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        })
+    }
+
+    fn build_vault_signer(
+        config: &VaultSignerConfig,
+        signer_name: &str,
+    ) -> Result<Signer, KoraError> {
+        let vault_addr = get_env_var_for_signer(&config.vault_addr_env, signer_name)?;
+        let vault_token = get_env_var_for_signer(&config.vault_token_env, signer_name)?;
+        let key_name = get_env_var_for_signer(&config.key_name_env, signer_name)?;
+        let pubkey = get_env_var_for_signer(&config.pubkey_env, signer_name)?;
+
+        Signer::from_vault(
+            vault_addr,
+            vault_token,
+            key_name,
+            pubkey,
+            config.http_config.as_ref().map(solana_keychain::HttpClientConfig::from),
+        )
+        .map_err(|e| {
+            KoraError::SigningError(format!(
+                "Failed to create Vault signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        })
+    }
+
+    async fn build_aws_kms_signer(
+        config: &AwsKmsSignerConfig,
+        signer_name: &str,
+    ) -> Result<Signer, KoraError> {
+        let key_id = get_env_var_for_signer(&config.key_id_env, signer_name)?;
+        let public_key = get_env_var_for_signer(&config.public_key_env, signer_name)?;
+        let region = config
+            .region_env
+            .as_ref()
+            .map(|env| get_env_var_for_signer(env, signer_name))
+            .transpose()?;
+
+        Signer::from_aws_kms(key_id, public_key, region).await.map_err(|e| {
+            KoraError::SigningError(format!(
+                "Failed to create AWS KMS signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        })
+    }
+
+    async fn build_fireblocks_signer(
+        config: &FireblocksSignerConfig,
+        signer_name: &str,
+    ) -> Result<Signer, KoraError> {
+        let api_key = get_env_var_for_signer(&config.api_key_env, signer_name)?;
+        let private_key_pem = get_env_var_for_signer(&config.private_key_pem_env, signer_name)?;
+        let vault_account_id = get_env_var_for_signer(&config.vault_account_id_env, signer_name)?;
+
+        let keychain_config = solana_keychain::FireblocksSignerConfig {
+            api_key,
+            private_key_pem,
+            vault_account_id,
+            asset_id: config.asset_id.clone(),
+            api_base_url: config.api_base_url.clone(),
+            poll_interval_ms: config.poll_interval_ms,
+            max_poll_attempts: config.max_poll_attempts,
+            use_program_call: config.use_program_call,
+            http_client_config: config
+                .http_config
+                .as_ref()
+                .map(solana_keychain::HttpClientConfig::from),
+        };
+
+        Signer::from_fireblocks(keychain_config).await.map_err(|e| {
+            KoraError::SigningError(format!(
+                "Failed to create Fireblocks signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        })
+    }
+
+    async fn build_gcp_kms_signer(
+        config: &GcpKmsSignerConfig,
+        signer_name: &str,
+    ) -> Result<Signer, KoraError> {
+        let key_name = get_env_var_for_signer(&config.key_name_env, signer_name)?;
+        let public_key = get_env_var_for_signer(&config.public_key_env, signer_name)?;
+        Signer::from_gcp_kms(key_name, public_key).await.map_err(|e| {
+            KoraError::SigningError(format!(
+                "Failed to create GCP KMS signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        })
+    }
+
+    async fn build_para_signer(
+        config: &ParaSignerConfig,
+        signer_name: &str,
+    ) -> Result<Signer, KoraError> {
+        let api_key = get_env_var_for_signer(&config.api_key_env, signer_name)?;
+        let wallet_id = get_env_var_for_signer(&config.wallet_id_env, signer_name)?;
+        Signer::from_para(api_key, wallet_id, None).await.map_err(|e| {
+            KoraError::SigningError(format!(
+                "Failed to create Para signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        })
+    }
+
+    fn build_cdp_signer(config: &CdpSignerConfig, signer_name: &str) -> Result<Signer, KoraError> {
+        let api_key_id = get_env_var_for_signer(&config.api_key_id_env, signer_name)?;
+        let api_key_secret = get_env_var_for_signer(&config.api_key_secret_env, signer_name)?;
+        let wallet_secret = get_env_var_for_signer(&config.wallet_secret_env, signer_name)?;
+        let address = get_env_var_for_signer(&config.address_env, signer_name)?;
+        Signer::from_cdp(solana_keychain::CdpSignerConfig {
+            api_key_id,
+            api_key_secret,
+            wallet_secret,
+            address,
+            network: None,
+            api_base_url: None,
+            http_client_config: config
+                .http_config
+                .as_ref()
+                .map(solana_keychain::HttpClientConfig::from),
+        })
+        .map_err(|e| {
+            KoraError::SigningError(format!(
+                "Failed to create CDP signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        })
+    }
+
+    async fn build_dfns_signer(
+        config: &DfnsSignerConfig,
+        signer_name: &str,
+    ) -> Result<Signer, KoraError> {
+        let auth_token = get_env_var_for_signer(&config.auth_token_env, signer_name)?;
+        let cred_id = get_env_var_for_signer(&config.cred_id_env, signer_name)?;
+        let private_key_pem = get_env_var_for_signer(&config.private_key_pem_env, signer_name)?;
+        let wallet_id = get_env_var_for_signer(&config.wallet_id_env, signer_name)?;
+        let keychain_config = solana_keychain::DfnsSignerConfig {
+            auth_token,
+            cred_id,
+            private_key_pem,
+            wallet_id,
+            api_base_url: config.api_base_url.clone(),
+            http_client_config: config
+                .http_config
+                .as_ref()
+                .map(solana_keychain::HttpClientConfig::from),
+        };
+        Signer::from_dfns(keychain_config).await.map_err(|e| {
+            KoraError::SigningError(format!(
+                "Failed to create Dfns signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        })
+    }
+
+    async fn build_openfort_signer(
+        config: &OpenfortSignerConfig,
+        signer_name: &str,
+    ) -> Result<Signer, KoraError> {
+        let secret_key = get_env_var_for_signer(&config.secret_key_env, signer_name)?;
+        let account_id = get_env_var_for_signer(&config.account_id_env, signer_name)?;
+        let wallet_secret = get_env_var_for_signer(&config.wallet_secret_env, signer_name)?;
+
+        let map_err = |e| {
+            KoraError::SigningError(format!(
+                "Failed to create Openfort signer '{signer_name}': {}",
+                sanitize_error!(e)
+            ))
+        };
+
+        let mut signer =
+            KeychainOpenfortSigner::from_config(solana_keychain::OpenfortSignerConfig {
+                secret_key,
+                account_id,
+                wallet_secret,
+                api_base_url: config.api_base_url.clone(),
+                http_client_config: config
+                    .http_config
+                    .as_ref()
+                    .map(solana_keychain::HttpClientConfig::from),
+            })
+            .map_err(map_err)?;
+        signer.init().await.map_err(map_err)?;
+        Ok(Signer::Openfort(signer))
+    }
+
+    /// Validate an individual signer configuration
+    pub fn validate_individual_signer_config(&self, index: usize) -> Result<(), KoraError> {
+        if self.name.is_empty() {
+            return Err(KoraError::ValidationError(format!(
+                "Signer at index {index} must have a non-empty name"
+            )));
+        }
+
+        let (kind, env_vars) = match &self.config {
+            SignerTypeConfig::Memory { config } => {
+                ("Memory", vec![("private_key_env", &config.private_key_env)])
+            }
+            SignerTypeConfig::Turnkey { config } => (
+                "Turnkey",
+                vec![
+                    ("api_public_key_env", &config.api_public_key_env),
+                    ("api_private_key_env", &config.api_private_key_env),
+                    ("organization_id_env", &config.organization_id_env),
+                    ("private_key_id_env", &config.private_key_id_env),
+                    ("public_key_env", &config.public_key_env),
+                ],
+            ),
+            SignerTypeConfig::Privy { config } => (
+                "Privy",
+                vec![
+                    ("app_id_env", &config.app_id_env),
+                    ("app_secret_env", &config.app_secret_env),
+                    ("wallet_id_env", &config.wallet_id_env),
+                ],
+            ),
+            SignerTypeConfig::Vault { config } => (
+                "Vault",
+                vec![
+                    ("vault_addr_env", &config.vault_addr_env),
+                    ("vault_token_env", &config.vault_token_env),
+                    ("key_name_env", &config.key_name_env),
+                    ("pubkey_env", &config.pubkey_env),
+                ],
+            ),
+            SignerTypeConfig::AwsKms { config } => (
+                "AWS KMS",
+                vec![
+                    ("key_id_env", &config.key_id_env),
+                    ("public_key_env", &config.public_key_env),
+                ],
+            ),
+            SignerTypeConfig::Fireblocks { config } => (
+                "Fireblocks",
+                vec![
+                    ("api_key_env", &config.api_key_env),
+                    ("private_key_pem_env", &config.private_key_pem_env),
+                    ("vault_account_id_env", &config.vault_account_id_env),
+                ],
+            ),
+            SignerTypeConfig::GcpKms { config } => (
+                "GCP KMS",
+                vec![
+                    ("key_name_env", &config.key_name_env),
+                    ("public_key_env", &config.public_key_env),
+                ],
+            ),
+            SignerTypeConfig::Para { config } => (
+                "Para",
+                vec![
+                    ("api_key_env", &config.api_key_env),
+                    ("wallet_id_env", &config.wallet_id_env),
+                ],
+            ),
+            SignerTypeConfig::Cdp { config } => (
+                "CDP",
+                vec![
+                    ("api_key_id_env", &config.api_key_id_env),
+                    ("api_key_secret_env", &config.api_key_secret_env),
+                    ("wallet_secret_env", &config.wallet_secret_env),
+                    ("address_env", &config.address_env),
+                ],
+            ),
+            SignerTypeConfig::Dfns { config } => (
+                "Dfns",
+                vec![
+                    ("auth_token_env", &config.auth_token_env),
+                    ("cred_id_env", &config.cred_id_env),
+                    ("private_key_pem_env", &config.private_key_pem_env),
+                    ("wallet_id_env", &config.wallet_id_env),
+                ],
+            ),
+            SignerTypeConfig::Openfort { config } => (
+                "Openfort",
+                vec![
+                    ("secret_key_env", &config.secret_key_env),
+                    ("account_id_env", &config.account_id_env),
+                    ("wallet_secret_env", &config.wallet_secret_env),
+                ],
+            ),
+        };
+
+        for (field_name, env_var) in env_vars {
+            if env_var.is_empty() {
+                return Err(KoraError::ValidationError(format!(
+                    "{kind} signer '{}' must specify non-empty {field_name}",
+                    self.name
+                )));
+            }
+            get_env_var_for_signer(env_var, &self.name)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_parse_valid_config() {
+        let toml_content = r#"
+[signer_pool]
+strategy = "round_robin"
+
+[[signers]]
+name = "memory_signer_1"
+type = "memory"
+private_key_env = "SIGNER_1_PRIVATE_KEY"
+weight = 1
+
+[[signers]]
+name = "turnkey_signer_1" 
+type = "turnkey"
+api_public_key_env = "TURNKEY_API_PUBLIC_KEY_1"
+api_private_key_env = "TURNKEY_API_PRIVATE_KEY_1"
+organization_id_env = "TURNKEY_ORG_ID_1"
+private_key_id_env = "TURNKEY_PRIVATE_KEY_ID_1"
+public_key_env = "TURNKEY_PUBLIC_KEY_1"
+weight = 2
+"#;
+
+        let config: SignerPoolConfig = toml::from_str(toml_content).unwrap();
+
+        assert_eq!(config.signers.len(), 2);
+        assert!(matches!(config.signer_pool.strategy, SelectionStrategy::RoundRobin));
+
+        let signer1 = &config.signers[0];
+        assert_eq!(signer1.name, "memory_signer_1");
+        assert_eq!(signer1.weight, Some(1));
+
+        if let SignerTypeConfig::Memory { config } = &signer1.config {
+            assert_eq!(config.private_key_env, "SIGNER_1_PRIVATE_KEY");
+        } else {
+            panic!("Expected Memory signer config");
+        }
+    }
+
+    #[test]
+    fn test_validate_config_success() {
+        let config = SignerPoolConfig {
+            signer_pool: SignerPoolSettings { strategy: SelectionStrategy::RoundRobin },
+            signers: vec![SignerConfig {
+                name: "test_signer".to_string(),
+                weight: Some(1),
+                config: SignerTypeConfig::Memory {
+                    config: MemorySignerConfig {
+                        private_key_env: "KORA_VALIDATE_SUCCESS_KEY_99".to_string(),
+                    },
+                },
+            }],
+        };
+
+        std::env::set_var("KORA_VALIDATE_SUCCESS_KEY_99", "dummy");
+        assert!(config.validate_signer_config().is_ok());
+        assert!(config.validate_strategy_weights().is_ok());
+        std::env::remove_var("KORA_VALIDATE_SUCCESS_KEY_99");
+    }
+
+    #[test]
+    fn test_validate_config_empty_signers() {
+        let config = SignerPoolConfig {
+            signer_pool: SignerPoolSettings { strategy: SelectionStrategy::RoundRobin },
+            signers: vec![],
+        };
+
+        assert!(config.validate_signer_config().is_err());
+    }
+
+    #[test]
+    fn test_validate_config_duplicate_names() {
+        let config = SignerPoolConfig {
+            signer_pool: SignerPoolSettings { strategy: SelectionStrategy::RoundRobin },
+            signers: vec![
+                SignerConfig {
+                    name: "duplicate".to_string(),
+                    weight: Some(1),
+                    config: SignerTypeConfig::Memory {
+                        config: MemorySignerConfig {
+                            private_key_env: "TEST_PRIVATE_KEY_1".to_string(),
+                        },
+                    },
+                },
+                SignerConfig {
+                    name: "duplicate".to_string(),
+                    weight: Some(1),
+                    config: SignerTypeConfig::Memory {
+                        config: MemorySignerConfig {
+                            private_key_env: "TEST_PRIVATE_KEY_2".to_string(),
+                        },
+                    },
+                },
+            ],
+        };
+
+        assert!(config.validate_signer_config().is_err());
+    }
+
+    #[test]
+    fn test_load_signers_config() {
+        let toml_content = r#"
+[signer_pool]
+strategy = "round_robin"
+
+[[signers]]
+name = "test_signer"
+type = "memory"
+private_key_env = "KORA_LOAD_CONFIG_KEY_99"
+"#;
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+        temp_file.write_all(toml_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        std::env::set_var("KORA_LOAD_CONFIG_KEY_99", "dummy");
+        let config = SignerPoolConfig::load_config(temp_file.path()).unwrap();
+        assert_eq!(config.signers.len(), 1);
+        assert_eq!(config.signers[0].name, "test_signer");
+        std::env::remove_var("KORA_LOAD_CONFIG_KEY_99");
+    }
+
+    #[test]
+    fn test_validate_memory_config_missing_env_var() {
+        let _m = crate::tests::config_mock::ConfigMockBuilder::new().build_and_setup();
+
+        let config = SignerPoolConfig {
+            signer_pool: SignerPoolSettings { strategy: SelectionStrategy::RoundRobin },
+            signers: vec![SignerConfig {
+                name: "test_signer_missing".to_string(),
+                weight: Some(1),
+                config: SignerTypeConfig::Memory {
+                    config: MemorySignerConfig {
+                        private_key_env: "KORA_TEST_MISSING_KEY_12345".to_string(),
+                    },
+                },
+            }],
+        };
+
+        std::env::remove_var("KORA_TEST_MISSING_KEY_12345");
+        let result = config.validate_signer_config();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), KoraError::ValidationError(_)));
+    }
+
+    #[test]
+    fn test_validate_memory_config_env_var_present() {
+        let _m = crate::tests::config_mock::ConfigMockBuilder::new().build_and_setup();
+
+        let config = SignerPoolConfig {
+            signer_pool: SignerPoolSettings { strategy: SelectionStrategy::RoundRobin },
+            signers: vec![SignerConfig {
+                name: "test_signer_present".to_string(),
+                weight: Some(1),
+                config: SignerTypeConfig::Memory {
+                    config: MemorySignerConfig {
+                        private_key_env: "KORA_TEST_PRESENT_KEY_12345".to_string(),
+                    },
+                },
+            }],
+        };
+
+        std::env::set_var("KORA_TEST_PRESENT_KEY_12345", "dummy_value");
+        let result = config.validate_signer_config();
+        assert!(result.is_ok());
+        std::env::remove_var("KORA_TEST_PRESENT_KEY_12345");
+    }
+
+    #[test]
+    fn test_turnkey_signer_builds_with_no_http_config() {
+        std::env::set_var(
+            "TURNKEY_API_PUBLIC_KEY",
+            "04746f04b2c1b181db8fb777e487504a500a501a500a501a500a501a500a501a501a501a501a501a501a501a501a501a501a501a501a501a501a501a501a50",
+        );
+        std::env::set_var(
+            "TURNKEY_API_PRIVATE_KEY",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        std::env::set_var("TURNKEY_ORG_ID", "test-org");
+        std::env::set_var("TURNKEY_PRIVATE_KEY_ID", "test-key-id");
+        std::env::set_var("TURNKEY_PUBLIC_KEY", "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV");
+
+        let config = TurnkeySignerConfig {
+            api_public_key_env: "TURNKEY_API_PUBLIC_KEY".to_string(),
+            api_private_key_env: "TURNKEY_API_PRIVATE_KEY".to_string(),
+            organization_id_env: "TURNKEY_ORG_ID".to_string(),
+            private_key_id_env: "TURNKEY_PRIVATE_KEY_ID".to_string(),
+            public_key_env: "TURNKEY_PUBLIC_KEY".to_string(),
+            http_config: None,
+        };
+
+        let result = SignerConfig::build_turnkey_signer(&config, "test");
+        assert!(result.is_ok());
+
+        std::env::remove_var("TURNKEY_API_PUBLIC_KEY");
+        std::env::remove_var("TURNKEY_API_PRIVATE_KEY");
+        std::env::remove_var("TURNKEY_ORG_ID");
+        std::env::remove_var("TURNKEY_PRIVATE_KEY_ID");
+        std::env::remove_var("TURNKEY_PUBLIC_KEY");
+    }
+
+    #[test]
+    fn test_vault_signer_builds_with_no_http_config() {
+        std::env::set_var("VAULT_ADDR", "http://127.0.0.1:8200");
+        std::env::set_var("VAULT_TOKEN", "token");
+        std::env::set_var("VAULT_KEY_NAME", "key");
+        std::env::set_var("VAULT_PUBKEY", "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV");
+
+        let config = VaultSignerConfig {
+            vault_addr_env: "VAULT_ADDR".to_string(),
+            vault_token_env: "VAULT_TOKEN".to_string(),
+            key_name_env: "VAULT_KEY_NAME".to_string(),
+            pubkey_env: "VAULT_PUBKEY".to_string(),
+            http_config: None,
+        };
+
+        let result = SignerConfig::build_vault_signer(&config, "test");
+        assert!(result.is_ok());
+
+        std::env::remove_var("VAULT_ADDR");
+        std::env::remove_var("VAULT_TOKEN");
+        std::env::remove_var("VAULT_KEY_NAME");
+        std::env::remove_var("VAULT_PUBKEY");
+    }
+
+    #[test]
+    fn test_cdp_signer_builds_with_no_http_config() {
+        std::env::set_var("CDP_API_KEY_ID", "key-id");
+        std::env::set_var("CDP_API_KEY_SECRET", "secret");
+        std::env::set_var("CDP_WALLET_SECRET", "secret");
+        std::env::set_var("CDP_ADDRESS", "7EcDhSYGxXyscszYEp35KHN8vvw3svAuLKTzXwCFLtV");
+
+        let config = CdpSignerConfig {
+            api_key_id_env: "CDP_API_KEY_ID".to_string(),
+            api_key_secret_env: "CDP_API_KEY_SECRET".to_string(),
+            wallet_secret_env: "CDP_WALLET_SECRET".to_string(),
+            address_env: "CDP_ADDRESS".to_string(),
+            http_config: None,
+        };
+
+        let result = SignerConfig::build_cdp_signer(&config, "test");
+        assert!(result.is_ok());
+
+        std::env::remove_var("CDP_API_KEY_ID");
+        std::env::remove_var("CDP_API_KEY_SECRET");
+        std::env::remove_var("CDP_WALLET_SECRET");
+        std::env::remove_var("CDP_ADDRESS");
+    }
+
+    #[tokio::test]
+    async fn test_fireblocks_signer_builds_with_no_http_config() {
+        const TEST_RSA_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQDKKw7fHhfK3/Ts\n-----END PRIVATE KEY-----";
+        std::env::set_var("FIREBLOCKS_API_KEY", "test");
+        std::env::set_var("FIREBLOCKS_PRIVATE_KEY_PEM", TEST_RSA_KEY);
+        std::env::set_var("FIREBLOCKS_VAULT_ACCOUNT_ID", "1");
+
+        let config = FireblocksSignerConfig {
+            api_key_env: "FIREBLOCKS_API_KEY".to_string(),
+            private_key_pem_env: "FIREBLOCKS_PRIVATE_KEY_PEM".to_string(),
+            vault_account_id_env: "FIREBLOCKS_VAULT_ACCOUNT_ID".to_string(),
+            asset_id: None,
+            api_base_url: None,
+            poll_interval_ms: None,
+            max_poll_attempts: None,
+            use_program_call: None,
+            http_config: None,
+        };
+
+        let result = SignerConfig::build_fireblocks_signer(&config, "test").await;
+        assert!(result.is_err());
+
+        std::env::remove_var("FIREBLOCKS_API_KEY");
+        std::env::remove_var("FIREBLOCKS_PRIVATE_KEY_PEM");
+        std::env::remove_var("FIREBLOCKS_VAULT_ACCOUNT_ID");
+    }
+}

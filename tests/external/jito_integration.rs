@@ -1,0 +1,51 @@
+use crate::common::FeePayerTestHelper;
+use kora_lib::bundle::{JitoClient, JitoConfig};
+
+const JITO_TESTNET_BLOCK_ENGINE_URL: &str = "https://dallas.testnet.block-engine.jito.wtf";
+
+#[tokio::test]
+async fn test_jito_testnet_connection() {
+    let config = JitoConfig {
+        block_engine_url: JITO_TESTNET_BLOCK_ENGINE_URL.to_string(),
+        simulate_bundle_url: None,
+    };
+    let client = JitoClient::new(&config);
+
+    let result =
+        client.get_bundle_statuses(vec!["00000000-0000-0000-0000-000000000000".to_string()]).await;
+
+    if let Err(e) = result {
+        let error_str = e.to_string();
+
+        if error_str.contains("Invalid") && error_str.contains("parse") {
+            panic!("Jito testnet integration test failed with code error: {e:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_jito_send_bundle() {
+    let ctx = crate::ctx().await;
+    let config = JitoConfig {
+        block_engine_url: JITO_TESTNET_BLOCK_ENGINE_URL.to_string(),
+        simulate_bundle_url: None,
+    };
+    let client = JitoClient::new(&config);
+
+    let encoded_tx = ctx
+        .transaction_builder()
+        .with_fee_payer(FeePayerTestHelper::get_fee_payer_pubkey())
+        .build()
+        .await
+        .expect("Failed to create transaction");
+
+    let response = client.send_bundle(&[encoded_tx]).await;
+
+    if let Err(e) = response {
+        let error_str = e.to_string();
+
+        if error_str.contains("404") {
+            panic!("Jito send bundle test failed with 404 error: {error_str:?}");
+        }
+    }
+}

@@ -1,145 +1,265 @@
+mod args;
+
+use args::GlobalArgs;
 use clap::{Parser, Subcommand};
+
 use kora_lib::{
-    args::CliArgs,
-    config::load_config,
+    admin::token_util::initialize_atas,
     error::KoraError,
-    rpc::{create_rpc_client, get_rpc_client},
-    signer::init::init_signer_type,
-    state::init_signer,
-    transaction::{
-        decode_b58_transaction, estimate_transaction_fee, sign_and_send_transaction,
-        sign_transaction, sign_transaction_if_paid, TokenPriceInfo,
-    },
+    log::LoggingFormat,
+    rpc::get_rpc_client,
+    rpc_server::{run_rpc_server, KoraRpc, RpcArgs},
+    signer::init::init_signers,
+    state::init_config,
+    validator::config_validator::ConfigValidator,
+    CacheUtil, Config,
 };
+
+#[cfg(feature = "docs")]
+use kora_lib::rpc_server::openapi::docs;
+#[cfg(feature = "docs")]
+use utoipa::OpenApi;
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Sign a transaction
-    Sign {
-        /// Base58 encoded transaction to sign
-        #[arg(long, short = 't')]
-        transaction: String,
+    /// Configuration management commands
+    Config {
+        #[command(subcommand)]
+        config_command: ConfigCommands,
     },
-    /// Sign and send a transaction
-    SignAndSend {
-        /// Base58 encoded transaction to sign and send
-        #[arg(long, short = 't')]
-        transaction: String,
+    /// RPC server operations
+    Rpc {
+        #[command(subcommand)]
+        rpc_command: RpcCommands,
     },
-    /// Estimate transaction fee
-    EstimateFee {
-        /// Base58 encoded transaction to estimate fee for
-        #[arg(long, short = 't')]
-        transaction: String,
+    /// Generate OpenAPI documentation
+    #[cfg(feature = "docs")]
+    Openapi {
+        /// Output path for the OpenAPI spec file
+        #[arg(short = 'o', long, default_value = "openapi.json")]
+        output: String,
     },
-    /// Sign transaction if paid
-    SignIfPaid {
-        /// Base58 encoded transaction to sign if paid
-        #[arg(long, short = 't')]
-        transaction: String,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Validate configuration file (fast, no RPC calls)
+    Validate {
+        /// Path to signers configuration file (optional)
         #[arg(long)]
-        margin: Option<f64>,
+        signers_config: Option<std::path::PathBuf>,
+    },
+    /// Validate configuration file with RPC validation (slower but more thorough)
+    ValidateWithRpc {
+        /// Path to signers configuration file (optional)
         #[arg(long)]
-        token_price: Option<f64>,
+        signers_config: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RpcCommands {
+    /// Start the RPC server
+    #[command(
+        about = "Start the RPC server",
+        long_about = "Start the Kora RPC server to handle gasless transactions.\n\nThe server will validate the configuration and initialize the specified signer before starting."
+    )]
+    Start {
+        #[command(flatten)]
+        rpc_args: Box<RpcArgs>,
+    },
+    /// Initialize ATAs for all allowed payment tokens
+    #[command(
+        about = "Initialize ATAs for all allowed payment tokens",
+        long_about = "Initialize Associated Token Accounts (ATAs) for all payment tokens configured in the system.\n\nThis command creates ATAs in the following priority order:\n1. If a payment address is configured, creates ATAs for that address only\n2. Otherwise, creates ATAs for ALL signers in the pool\n\nYou can specify which signer to use as the fee payer for the ATA creation transactions.\nIf no fee payer is specified, the first signer in the pool will be used."
+    )]
+    InitializeAtas {
+        #[command(flatten)]
+        rpc_args: Box<RpcArgs>,
+
+        /// Signer key to use as fee payer (defaults to first signer if not specified)
+        #[arg(long, help_heading = "Signer Options")]
+        fee_payer_key: Option<String>,
+
+        /// Compute unit price for priority fees (in micro-lamports)
+        #[arg(long, help_heading = "Transaction Options")]
+        compute_unit_price: Option<u64>,
+
+        /// Compute unit limit for transactions
+        #[arg(long, help_heading = "Transaction Options")]
+        compute_unit_limit: Option<u32>,
+
+        /// Number of ATAs to create per transaction
+        #[arg(long, help_heading = "Transaction Options")]
+        chunk_size: Option<usize>,
     },
 }
 
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = "Kora - Solana gasless transaction relayer", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
 
     #[command(flatten)]
-    pub args: CliArgs,
+    pub global_args: GlobalArgs,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), KoraError> {
+    dotenv::dotenv().ok();
     let cli = Cli::parse();
 
-    let config = load_config(&cli.args.common.config).unwrap_or_else(|e| {
-        print_error(&format!("Failed to load config: {}", e));
+    let config = Config::load_config(&cli.global_args.config).unwrap_or_else(|e| {
+        print_error(&format!("Failed to load config: {e}"));
         std::process::exit(1);
     });
 
-    let rpc_client = get_rpc_client(&cli.args.common.rpc_url);
-
-    if let Err(e) = config.validate(rpc_client.as_ref()).await {
-        print_error(&format!("Config validation failed: {}", e));
+    init_config(config).unwrap_or_else(|e| {
+        print_error(&format!("Failed to initialize config: {e}"));
         std::process::exit(1);
-    }
+    });
 
-    // Initialize the signer
-    if !cli.args.common.skip_signer {
-        let signer = init_signer_type(&cli.args.common).unwrap();
-        init_signer(signer).unwrap_or_else(|e| {
-            print_error(&format!("Failed to initialize signer: {}", e));
-            std::process::exit(1);
-        });
-    }
+    let rpc_client = get_rpc_client(&cli.global_args.rpc_url);
 
     match cli.command {
-        Some(Commands::Sign { transaction }) => {
-            let rpc_client = create_rpc_client(&cli.args.common.rpc_url).await?;
-            let validation = config.validation;
-
-            let transaction = decode_b58_transaction(&transaction).map_err(|e| {
-                print_error(&format!("Failed to decode transaction: {}", e));
-                e
-            })?;
-
-            let (transaction, signed_tx) =
-                sign_transaction(&rpc_client, &validation, transaction).await?;
-            println!("Signature: {}", transaction.signatures[0]);
-            println!("Signed Transaction: {}", signed_tx);
-        }
-        Some(Commands::SignAndSend { transaction }) => {
-            if transaction.is_empty() {
-                print_error("No transaction provided. Please provide a base58-encoded transaction using the --transaction flag.");
-                std::process::exit(1);
+        Some(Commands::Config { config_command }) => {
+            let validation_result = match config_command {
+                ConfigCommands::Validate { signers_config } => {
+                    ConfigValidator::validate_with_result_and_signers(
+                        rpc_client.as_ref(),
+                        true,
+                        signers_config.as_ref(),
+                    )
+                    .await
+                }
+                ConfigCommands::ValidateWithRpc { signers_config } => {
+                    ConfigValidator::validate_with_result_and_signers(
+                        rpc_client.as_ref(),
+                        false,
+                        signers_config.as_ref(),
+                    )
+                    .await
+                }
+            };
+            match validation_result {
+                Ok(_) => std::process::exit(0),
+                Err(_) => std::process::exit(1),
             }
-            let rpc_client = create_rpc_client(&cli.args.common.rpc_url).await?;
-            let validation = config.validation;
-
-            let transaction = decode_b58_transaction(&transaction).map_err(|e| {
-                print_error(&format!("Failed to decode transaction: {}", e));
-                e
-            })?;
-
-            let (signature, signed_tx) =
-                sign_and_send_transaction(&rpc_client, &validation, transaction).await?;
-            println!("Signature: {}", signature);
-            println!("Signed Transaction: {}", signed_tx);
         }
-        Some(Commands::EstimateFee { transaction }) => {
-            let rpc_client = create_rpc_client(&cli.args.common.rpc_url).await?;
+        Some(Commands::Rpc { rpc_command }) => match rpc_command {
+            RpcCommands::Start { rpc_args } => {
+                rpc_args.auth_args.apply_to_env();
 
-            let transaction = decode_b58_transaction(&transaction).map_err(|e| {
-                print_error(&format!("Failed to decode transaction: {}", e));
-                e
-            })?;
+                match ConfigValidator::validate_with_result_and_signers(
+                    rpc_client.as_ref(),
+                    true,
+                    rpc_args.signers_config.as_ref(),
+                )
+                .await
+                {
+                    Err(errors) => {
+                        for e in errors {
+                            print_error(&format!("Validation error: {e}"));
+                        }
+                        std::process::exit(1);
+                    }
+                    Ok(warnings) => {
+                        for w in warnings {
+                            println!("Warning: {w}");
+                        }
+                    }
+                }
 
-            let fee = estimate_transaction_fee(&rpc_client, &transaction).await?;
-            println!("Estimated fee: {} lamports", fee);
-        }
-        Some(Commands::SignIfPaid { transaction, margin, token_price }) => {
-            let rpc_client = create_rpc_client(&cli.args.common.rpc_url).await?;
-            let validation = config.validation;
+                setup_logging(&rpc_args.logging_format);
 
-            let transaction = decode_b58_transaction(&transaction).map_err(|e| {
-                print_error(&format!("Failed to decode transaction: {}", e));
-                e
-            })?;
+                if !rpc_args.skip_signer {
+                    init_signers(&rpc_args).await.unwrap_or_else(|e| {
+                        print_error(&format!("Failed to initialize signer(s): {e}"));
+                        std::process::exit(1);
+                    });
+                }
 
-            let (transaction, signed_tx) =
-                sign_transaction_if_paid(&rpc_client, &validation, transaction, margin).await?;
+                if let Err(e) = CacheUtil::init().await {
+                    print_error(&format!("Failed to initialize cache: {e}"));
+                    std::process::exit(1);
+                }
 
-            println!("Signature: {}", transaction.signatures[0]);
-            println!("Signed Transaction: {}", signed_tx);
+                let rpc_client = get_rpc_client(&cli.global_args.rpc_url);
+
+                let kora_rpc = KoraRpc::new(rpc_client);
+
+                let handles = run_rpc_server(kora_rpc, rpc_args.port).await?;
+
+                wait_for_shutdown_signal().await;
+                println!("Shutting down server...");
+
+                handles.shutdown(rpc_args.port).await;
+            }
+            RpcCommands::InitializeAtas {
+                rpc_args,
+                fee_payer_key,
+                compute_unit_price,
+                compute_unit_limit,
+                chunk_size,
+            } => {
+                if !rpc_args.skip_signer {
+                    init_signers(&rpc_args).await.unwrap_or_else(|e| {
+                        print_error(&format!("Failed to initialize signer(s): {e}"));
+                        std::process::exit(1);
+                    });
+                } else {
+                    print_error("Cannot initialize ATAs without a signer.");
+                    std::process::exit(1);
+                }
+
+                if let Err(e) = CacheUtil::init().await {
+                    print_error(&format!("Failed to initialize cache: {e}"));
+                    std::process::exit(1);
+                }
+
+                if let Err(e) = initialize_atas(
+                    rpc_client.as_ref(),
+                    compute_unit_price,
+                    compute_unit_limit,
+                    chunk_size,
+                    fee_payer_key,
+                )
+                .await
+                {
+                    print_error(&format!("Failed to initialize ATAs: {e}"));
+                    std::process::exit(1);
+                }
+                println!("Successfully initialized all payment ATAs");
+            }
+        },
+
+        #[cfg(feature = "docs")]
+        Some(Commands::Openapi { output }) => {
+            docs::update_docs();
+
+            let openapi_spec = docs::ApiDoc::openapi();
+            let json = serde_json::to_string_pretty(&openapi_spec).unwrap_or_else(|e| {
+                print_error(&format!("Failed to serialize OpenAPI spec: {e}"));
+                std::process::exit(1);
+            });
+
+            std::fs::write(&output, json).unwrap_or_else(|e| {
+                print_error(&format!("Failed to write OpenAPI spec to {}: {e}", output));
+                std::process::exit(1);
+            });
+
+            println!("OpenAPI spec written to: {}", output);
         }
         None => {
             println!("No command specified. Use --help for usage information.");
+            println!("Available commands:");
+            println!("  config validate          - Validate configuration");
+            println!("  config validate-with-rpc - Validate configuration with RPC calls");
+            println!("  rpc start                - Start RPC server");
+            println!("  rpc initialize-atas      - Initialize ATAs for payment tokens");
+            #[cfg(feature = "docs")]
+            println!("  openapi                  - Generate OpenAPI documentation");
         }
     }
 
@@ -147,6 +267,37 @@ async fn main() -> Result<(), KoraError> {
 }
 
 fn print_error(message: &str) {
-    eprintln!("Error: {}", message);
-    std::process::exit(1);
+    eprintln!("Error: {message}");
+}
+
+#[cfg(unix)]
+async fn wait_for_shutdown_signal() {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("Failed to install SIGTERM handler");
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => {
+            if let Err(e) = result {
+                panic!("Error waiting for Ctrl+C signal: {e:?}");
+            }
+        }
+        _ = sigterm.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_shutdown_signal() {
+    if let Err(e) = tokio::signal::ctrl_c().await {
+        panic!("Error waiting for Ctrl+C signal: {e:?}");
+    }
+}
+
+fn setup_logging(format: &LoggingFormat) {
+    let env_filter = std::env::var("RUST_LOG")
+        .unwrap_or_else(|_| "info,sqlx=error,sea_orm_migration=error,jsonrpsee_server=warn".into());
+
+    let subscriber = tracing_subscriber::fmt().with_env_filter(env_filter);
+    match format {
+        LoggingFormat::Standard => subscriber.init(),
+        LoggingFormat::Json => subscriber.json().init(),
+    }
 }

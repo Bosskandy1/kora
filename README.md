@@ -1,444 +1,176 @@
-# Kora
+<div align="center">
+  <br />
+  <img src="./kora.svg" alt="Kora" width="140" />
+  <br />
+  <br />
+  
+  <h3>Kora: Solana Signing Infrastructure</h3>
+    
+  <br />
+  
+[![Integration Tests](https://github.com/solana-foundation/kora/actions/workflows/integration.yml/badge.svg)](https://github.com/solana-foundation/kora/actions/workflows/integration.yml)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/solana-foundation/kora)
+[![Crates.io](https://img.shields.io/crates/v/kora-cli.svg)](https://crates.io/crates/kora-cli)
+[![npm](https://img.shields.io/npm/v/@solana/kora)](https://www.npmjs.com/package/@solana/kora)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Kora is a Solana paymaster node that provides a JSON-RPC interface for handling gasless transactions and fee abstractions. It enables developers to build applications where users can pay transaction fees in tokens other than SOL.
+  <br />
+  <br />
+</div>
 
-## Features
+> **Branch Model (Mar 18, 2026):** `main` is the integration branch and may contain audited and unaudited commits. Audit status is tracked per commit/tag in [`audits/AUDIT_STATUS.md`](audits/AUDIT_STATUS.md). Stable production releases are published from tagged audited snapshots.
 
-- JSON-RPC server with middleware support
-- Transaction fee estimation in any supported token
-- Gasless transaction support
-- Transfer transactions with any supported token
-- Remote signer support
-- Disallowed account, allowed spl tokens, programs config
+**Kora is your Solana signing infrastructure.** Enable gasless transactions where users pay fees in any token—USDC, BONK, or your app's native token—or handle any transaction signing that requires a trusted signer.
 
-> Note: only `signAndSend` submits a transaction to an RPC, all other methods only return a signed transaction
+### Why Kora?
 
-## Crates
+- **Better UX**: Users never need SOL  
+- **Revenue Control**: Collect fees in USDC, your token, or anything else  
+- **Production Ready**: Secure validation, rate limiting, monitoring built-in  
+- **Easy Integration**: JSON-RPC API + TypeScript SDK  
+- **Flexible Deployment**: Railway, Docker, or any cloud platform
 
-- `kora-lib`: Shared library for kora
-- `kora-rpc`: JSON-RPC server
-- `kora-cli`: Command line interface for kora
+### Architecture
 
-## Getting Started
+- **Language**: Rust with TypeScript SDK
+- **Protocol**: JSON-RPC 2.0  
+- **Signers**: Solana Private Key, Turnkey, Privy, Openfort
+- **Authentication**: API Key, HMAC, or none
+- **Deployment**: Flexible deployment options (Docker, Railway, etc.) 
+
+### Features
+
+- Configurable validation rules and allowlists
+- Full Token-2022 support with extension filtering
+- Redis caching for improved performance
+- Rate limiting and spend protection
+- Secure key management (Turnkey, Privy, Vault, Openfort)
+- HMAC and API key authentication
+- Prometheus metrics and monitoring
+- Enhanced fee payer protection policies
+
+## Quick Start
+
+Install Kora: 
+
+```bash
+cargo install kora-cli
+```
+
+Basic usage:
+
+```bash
+kora rpc [OPTIONS] # --help for full list of options
+```
+
+**[→ Full Documentation](https://launch.solana.com/docs/kora/getting-started)** - Learn how Kora works
+
+**[→ Quick Start Guide](https://launch.solana.com/docs/kora/getting-started/quick-start)** - Get Kora running locally minutes
+
+**[→ Node Operator Guide](https://launch.solana.com/docs/kora/operators)** - Run a paymaster
+
+
+## TypeScript SDK
+
+Kora provides a simple JSON-RPC interface:
+
+```typescript
+// Initialize Kora client
+import { KoraClient } from '@solana/kora';
+const kora = new KoraClient({ rpcUrl: 'http://localhost:8080' });
+
+// Sign transaction as paymaster
+const signed = await kora.signTransaction({ transaction });
+```
+
+**[→ API Reference](https://launch.solana.com/docs/kora/json-rpc-api)**
+
+## Local Development
+
+### Prerequisites
+
+- [Just](https://github.com/casey/just) (command runner)
+- Rust 1.86+
+- Solana CLI 2.2+
+- Node.js 20+ and pnpm (for SDK)
 
 ### Installation
 
 ```bash
 git clone https://github.com/solana-foundation/kora.git
 cd kora
-make install
+just install
+```
+
+### Build
+
+```bash
+just build
 ```
 
 ### Running the Server
 
 Basic usage:
-```bash
-kora -- [OPTIONS]
-```
-
-### Configuration
-
-#### Command Line Arguments
-
-| Option | Description | Default |
-|--------|-------------|---------|
-| `-p, --port <PORT>` | Port number for the RPC server | 8080 |
-| `--rpc-url <RPC_URL>` | RPC URL to connect to | http://127.0.0.1:8899 |
-| `--logging-format <FORMAT>` | Logging format (standard or json) | standard |
-| `--metrics-endpoint <ENDPOINT>` | Optional metrics endpoint URL | - |
-| `--private-key <PRIVATE_KEY>` | Base58-encoded private key for signing | - |
-| `--config <FILE>` | Path to kora.toml config file | kora.toml |
-| `--no-load-signer` | Skip loading the signer | false |
-| `--with-turnkey-signer` | Use Turnkey signer | false |
-| `--turnkey-api-public-key <TURNKEY_API_PUBLIC_KEY>` | Turnkey API public key | - |
-| `--turnkey-api-private-key <TURNKEY_API_PRIVATE_KEY>` | Turnkey API private key | - |
-| `--turnkey-organization-id <TURNKEY_ORGANIZATION_ID>` | Turnkey organization ID | - |
-| `--turnkey-private-key-id <TURNKEY_PRIVATE_KEY_ID>` | Turnkey private key ID | - |
-| `--turnkey-public-key <TURNKEY_PUBLIC_KEY>` | Turnkey public key | - |
-
-#### Environment Variables
-
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `RUST_LOG` | Controls log level and filtering | "info,sqlx=error" |
-| `RPC_URL` | Alternative way to specify the RPC URL | - |
-| `KORA_PRIVATE_KEY` | Alternative way to specify the signing private key | - |
-| `TURNKEY_API_PUBLIC_KEY` | Turnkey API public key | - |
-| `TURNKEY_API_PRIVATE_KEY` | Turnkey API private key | - |
-| `TURNKEY_ORGANIZATION_ID` | Turnkey organization ID | - |
-| `TURNKEY_PRIVATE_KEY_ID` | Turnkey private key ID | - |
-| `TURNKEY_PUBLIC_KEY` | Turnkey public key | - |
-| `TEST_SENDER_PUBKEY` | Test sender pubkey | - |
-| `TEST_SENDER_MNEMONIC` | Test sender mnemonic | - |
-
-#### Configuration File (kora.toml)
-
-The `kora.toml` file configures the paymaster node's features and supported tokens:
-
-```toml
-[validation]
-max_allowed_lamports = 1000000
-max_signatures = 10
-allowed_programs = [
-    "11111111111111111111111111111111",  # System Program
-    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",  # Token Program
-]
-allowed_tokens = [
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-    "So11111111111111111111111111111111111111112",  # SOL
-]
-allowed_spl_paid_tokens = [
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
-]
-disallowed_accounts = []
-```
-
-## API Reference
-
-### RPC Methods
-
-#### `estimateTransactionFee`
-
-Estimates the transaction fee in terms of a specified token.
-
-```json
-// Request
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "estimateTransactionFee",
-    "params": [
-        {
-            "transaction": "<base58-encoded-transaction>",
-            "fee_token": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-        }
-    ]
-}
-
-// Response
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "result": {
-        "fee_in_lamports": "1000000"
-    }
-}
-```
-
-
-#### `getSupportedTokens`
-
-Returns supported token addresses.
-
-```json
-// Request
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "getSupportedTokens",
-    "params": []
-}
-
-// Response
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "result": {
-        "tokens": [
-            "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
-            "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
-            "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
-            "So11111111111111111111111111111111111111112"
-        ]
-    }
-}
-```
-
-#### `signTransaction`
-
-Signs a transaction with the paymaster's key.
-
-```json
-// Request
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "signTransaction",
-    "params": [
-        {
-            "transaction": "<base58-encoded-transaction>"
-        }
-    ]
-}
-
-// Response
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "result": {
-        "signature": "<base58-encoded-signature>",
-        "signed_transaction": "<base58-encoded-signed-transaction>"
-    }
-}
-```
-
-#### `signAndSend`
-
-Signs and submits a transaction to the network.
-
-```json
-// Request
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "signAndSend",
-    "params": [
-        {
-            "transaction": "<base58-encoded-transaction>"
-        }
-    ]
-}
-
-// Response
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "result": {
-        "signature": "<base58-encoded-signature>",
-        "signed_transaction": "<base58-encoded-signed-transaction>"
-    }
-}
-```
-
-#### `transactionTransfer`
-
-Create a transfer request and sign as the paymaster (SPL and SOL)
-
-```json
-// Request
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "transactionTransfer",
-    "params": [
-        1000000, // lamports value
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", // mint address
-        "5KKsLVU6TcbVDK4BS6K1DGDxnh4Q9xjYJ8XaDCG5t8ht", // source
-        "AVmDft8deQEo78bRKcGN5ZMf3hyjeLBK4Rd4xGB46yQM" // recipient
-    ]
-}
-
-// Response
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "result": {
-        "transaction": "<base58-encoded-transaction>",
-        "message": "<message>",
-        "blockhash": "<base58-encoded-blockhash>"
-    }
-}
-```
-
-#### `getBlockhash`
-
-Returns the latest blockhash.
-
-```json
-// Request
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "getBlockhash",
-    "params": []
-}
-
-// Response
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "result": {
-        "blockhash": "<base58-encoded-blockhash>"
-    }
-}
-```
-
-#### `getConfig`
-
-Returns the paymaster configuration.
-
-```json
-// Request
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "getConfig",
-    "params": []
-}
-
-// Response
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "result": {
-        "fee_payer": "<payer-pubkey>",
-        "validation_config": {
-            "max_allowed_lamports": 1000000,
-            "max_signatures": 10,
-            "allowed_programs": ["11111111111111111111111111111111", "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"],
-            "allowed_tokens": ["EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "So11111111111111111111111111111111111111112"]
-        }
-    }
-}
-```
-
-<!-- #### `swapToSol`
-
-Creates a swap request to SOL and returns a signed transaction.
-
-```json
-// Request
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "swapToSol",
-    "params": [
-        "<account-pubkey>",
-        100,
-        "<token-mint-address>"
-    ]
-}
-
-// Response
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "result": {
-        "signature": "<base58-encoded-signature>",
-        "transaction": "<base58-encoded-transaction>"
-    }
-}
-``` -->
-
-#### `signTransactionIfPaid`
-
-Signs a transaction if the user has paid the required amount of tokens.
-
-```json
-// Request
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "method": "signTransactionIfPaid",
-    "params": [
-        {
-            "transaction": "<base58-encoded-transaction>",
-            "cost_in_lamports": 1000000,
-            "margin": 0.0
-        }
-    ]
-}
-
-// Response
-{
-    "jsonrpc": "2.0",
-    "id": 1,
-    "result": {
-        "signature": "<base58-encoded-signature>",
-        "signed_transaction": "<base58-encoded-signed-transaction>"
-    }
-}
-```
-
-## Development
-
-### Prerequisites
-
-- Rust 1.70 or later
-- Solana CLI tools (for testing)
-- A Solana RPC endpoint (local or remote)
-- Docker
-- swagger-cli (`npm install -g swagger-cli`) for API documentation
-
-### Building
 
 ```bash
-# Build
-make build
+kora rpc [OPTIONS]
 ```
 
-### Testing
+Or for running with a test configuration, run:
 
 ```bash
-# Run all tests
-make test
-
-# Run integration tests
-make test-integrations
+just run
 ```
 
-### Running
+### Local Testing
+
+And run all tests:
 
 ```bash
-# Basic
-kora -- \
-    --rpc-url <RPC_URL> \
-    --port <PORT> 
-
-# With Turnkey (or use environment variables)
-kora -- \
-    --rpc-url <RPC_URL> \
-    --port <PORT> \
-    --with-turnkey-signer \
-    --turnkey-api-public-key <TURNKEY_API_PUBLIC_KEY> \
-    --turnkey-api-private-key <TURNKEY_API_PRIVATE_KEY> \
-    --turnkey-organization-id <TURNKEY_ORGANIZATION_ID> \
-    --turnkey-private-key-id <TURNKEY_PRIVATE_KEY_ID> \
-    --turnkey-public-key <TURNKEY_PUBLIC_KEY>
-
-# No signer
-kora -- \
-    --rpc-url <RPC_URL> \
-    --port <PORT> \
-    --no-load-signer
-
-# Load private key at runtime without .env
-kora -- \
-    --rpc-url <RPC_URL> \
-    --port <PORT> \
-    --private-key <PRIVATE_KEY>
+just test
 ```
 
-### Code Quality
+## Repository Structure
 
-```bash
-# Run clippy with warnings as errors
-make lint
-
-# Run clippy with auto-fix
-make lint-fix-all
-
-# Format code
-make fmt
-
-# Openapi
-make openapi
+```
+kora/
+├── crates/                   # Rust workspace
+│   ├── kora-lib/             # Core library with RPC server (signers, validation, transactions)
+│   └── kora-cli/             # Command-line interface and RPC server
+├── sdks/                     # Client SDKs
+│   └── ts/                   # TypeScript SDK
+├── tests/                    # Integration tests
+├── docs/                     # Documentation
+│   ├── getting-started/      # Quick start guides
+│   └── operators/            # Node operator documentation
+├── justfile                  # Build and development commands
+└── kora.toml                 # Example configuration
 ```
 
-### Local Development
+## Security Audit
 
-1. Start a local Solana validator:
-   ```bash
-   solana-test-validator
-   ```
+Kora has been audited by [Runtime Verification](https://runtimeverification.com/). View the [audit report](audits/20251119_runtime-verification.pdf).
 
-2. Run the server with development settings:
-   ```bash
-   RUST_LOG=debug cargo run -- --port 9000 --rpc-url http://localhost:8899
-   ```
+Audit status, audited-through commit, and the current unaudited delta are tracked in [audits/AUDIT_STATUS.md](audits/AUDIT_STATUS.md).
 
-## License
+**Note:** Kora uses the `solana-keychain` package which has not been audited. Use at your own risk.
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+
+
+## Community & Support
+
+- **Questions?** Ask on [Solana Stack Exchange](https://solana.stackexchange.com/) (use the `kora` tag)
+- **Issues?** Report on [GitHub Issues](https://github.com/solana-foundation/kora/issues)
+- **Operators:** Running Kora in production? Reach out to [@a_milz](https://x.com/a_milz) or [@dev_jodee](https://x.com/dev_jodee) on X to join our operator Slack channel for updates and support
+
+## Other Resources
+
+- [Kora CLI Crates.io](https://crates.io/crates/kora-cli) - Rust crate for running a Kora node
+- [Kora Lib Crates.io](https://crates.io/crates/kora-lib) - Rust crate for the Kora library
+- [@solana/kora](https://www.npmjs.com/package/@solana/kora) - TypeScript SDK for Kora
+
+---
+
+Built and maintained by the [Solana Foundation](https://solana.org).
+
+Licensed under MIT. See [LICENSE](LICENSE) for details.
